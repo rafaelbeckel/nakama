@@ -15,25 +15,27 @@
 package server
 
 import (
-	"context"
+	"net"
 	"net/http"
-	"time"
+	"strconv"
 
-	"github.com/golang/protobuf/jsonpb"
+	"github.com/gofrs/uuid"
 	"github.com/gorilla/websocket"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/trace"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-var SocketWsStatsCtx = context.Background()
-
-func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry SessionRegistry, matchmaker Matchmaker, tracker Tracker, runtime *Runtime, jsonpbMarshaler *jsonpb.Marshaler, jsonpbUnmarshaler *jsonpb.Unmarshaler, pipeline *Pipeline) func(http.ResponseWriter, *http.Request) {
+func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry *StatusRegistry, matchmaker Matchmaker, tracker Tracker, metrics Metrics, runtime *Runtime, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, pipeline *Pipeline) func(http.ResponseWriter, *http.Request) {
 	upgrader := &websocket.Upgrader{
-		ReadBufferSize:  int(config.GetSocket().MaxMessageSizeBytes),
-		WriteBufferSize: int(config.GetSocket().MaxMessageSizeBytes),
+		ReadBufferSize:  config.GetSocket().ReadBufferSizeBytes,
+		WriteBufferSize: config.GetSocket().WriteBufferSizeBytes,
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
+
+	sessionIdGen := uuid.NewGenWithHWAF(func() (net.HardwareAddr, error) {
+		hash := NodeToHash(config.GetName())
+		return hash[:], nil
+	})
 
 	// This handler will be attached to the API Gateway server.
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -58,49 +60,67 @@ func NewSocketWsAcceptor(logger *zap.Logger, config Config, sessionRegistry Sess
 			http.Error(w, "Missing or invalid token", 401)
 			return
 		}
-		userID, username, expiry, ok := parseToken([]byte(config.GetSession().EncryptionKey), token)
-		if !ok {
+		userID, username, vars, expiry, _, ok := parseToken([]byte(config.GetSession().EncryptionKey), token)
+		if !ok || !sessionCache.IsValidSession(userID, expiry, token) {
 			http.Error(w, "Missing or invalid token", 401)
 			return
 		}
 
-		clientIP, clientPort := extractClientAddressFromRequest(logger, r)
-
-		status := false
-		if r.URL.Query().Get("status") == "true" {
-			status = true
+		// Extract lang query parameter. Use a default if empty or not present.
+		lang := "en"
+		if langParam := r.URL.Query().Get("lang"); langParam != "" {
+			lang = langParam
 		}
 
 		// Upgrade to WebSocket.
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			// http.Error is invoked automatically from within the Upgrade function.
-			logger.Warn("Could not upgrade to WebSocket", zap.Error(err))
+			logger.Debug("Could not upgrade to WebSocket", zap.Error(err))
 			return
 		}
 
+		clientIP, clientPort := extractClientAddressFromRequest(logger, r)
+		status, _ := strconv.ParseBool(r.URL.Query().Get("status"))
+		sessionID := uuid.Must(sessionIdGen.NewV1())
+
 		// Mark the start of the session.
-		startNanos := time.Now().UTC().UnixNano()
-		stats.Record(SocketWsStatsCtx, MetricsSocketWsOpenCount.M(1))
-		_, span := trace.StartSpan(SocketWsStatsCtx, "nakama.session.ws")
+		metrics.CountWebsocketOpened(1)
 
 		// Wrap the connection for application handling.
-		session := NewSessionWS(logger, config, format, userID, username, expiry, clientIP, clientPort, jsonpbMarshaler, jsonpbUnmarshaler, conn, sessionRegistry, matchmaker, tracker, runtime)
+		session := NewSessionWS(logger, config, format, sessionID, userID, username, vars, expiry, clientIP, clientPort, lang, protojsonMarshaler, protojsonUnmarshaler, conn, sessionRegistry, statusRegistry, matchmaker, tracker, metrics, pipeline, runtime)
 
 		// Add to the session registry.
 		sessionRegistry.Add(session)
 
-		// Register initial presences for this session.
-		tracker.Track(session.ID(), PresenceStream{Mode: StreamModeNotifications, Subject: session.UserID()}, session.UserID(), PresenceMeta{Format: session.Format(), Username: session.Username(), Hidden: true}, true)
+		// Register initial status tracking and presence(s) for this session.
+		statusRegistry.Follow(sessionID, map[uuid.UUID]struct{}{userID: {}})
 		if status {
-			tracker.Track(session.ID(), PresenceStream{Mode: StreamModeStatus, Subject: session.UserID()}, session.UserID(), PresenceMeta{Format: session.Format(), Username: session.Username(), Status: ""}, false)
+			// Both notification and status presence.
+			tracker.TrackMulti(session.Context(), sessionID, []*TrackerOp{
+				{
+					Stream: PresenceStream{Mode: StreamModeNotifications, Subject: userID},
+					Meta:   PresenceMeta{Format: format, Username: username, Hidden: true},
+				},
+				{
+					Stream: PresenceStream{Mode: StreamModeStatus, Subject: userID},
+					Meta:   PresenceMeta{Format: format, Username: username, Status: ""},
+				},
+			}, userID, true)
+		} else {
+			// Only notification presence.
+			tracker.Track(session.Context(), sessionID, PresenceStream{Mode: StreamModeNotifications, Subject: userID}, userID, PresenceMeta{Format: format, Username: username, Hidden: true}, true)
+		}
+
+		if config.GetSession().SingleSocket {
+			// Kick any other sockets for this user.
+			go sessionRegistry.SingleSession(session.Context(), tracker, userID, sessionID)
 		}
 
 		// Allow the server to begin processing incoming messages from this session.
-		session.Consume(pipeline.ProcessRequest)
+		session.Consume()
 
 		// Mark the end of the session.
-		span.End()
-		stats.Record(SocketWsStatsCtx, MetricsSocketWsTimeSpentMsec.M(float64(time.Now().UTC().UnixNano()-startNanos)/1000), MetricsSocketWsCloseCount.M(1))
+		metrics.CountWebsocketClosed(1)
 	}
 }

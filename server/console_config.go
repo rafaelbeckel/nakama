@@ -21,16 +21,16 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/golang/protobuf/ptypes/empty"
-	"github.com/heroiclabs/nakama/console"
+	"github.com/heroiclabs/nakama/v3/console"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-const ObfuscationString = "********"
+const ObfuscationString = "REDACTED"
 
-func (s *ConsoleServer) GetConfig(ctx context.Context, in *empty.Empty) (*console.Config, error) {
+func (s *ConsoleServer) GetConfig(ctx context.Context, in *emptypb.Empty) (*console.Config, error) {
 	cfg, err := s.config.Clone()
 	if err != nil {
 		s.logger.Error("Error cloning config.", zap.Error(err))
@@ -39,15 +39,15 @@ func (s *ConsoleServer) GetConfig(ctx context.Context, in *empty.Empty) (*consol
 
 	cfg.GetConsole().Password = ObfuscationString
 	for i, address := range cfg.GetDatabase().Addresses {
-		rawUrl := fmt.Sprintf("postgresql://%s", address)
-		parsedUrl, err := url.Parse(rawUrl)
+		rawURL := fmt.Sprintf("postgresql://%s", address)
+		parsedURL, err := url.Parse(rawURL)
 		if err != nil {
 			s.logger.Error("Error parsing database address in config.", zap.Error(err))
 			return nil, status.Error(codes.Internal, "Error processing config.")
 		}
-		if parsedUrl.User != nil {
-			if password, isSet := parsedUrl.User.Password(); isSet {
-				cfg.GetDatabase().Addresses[i] = strings.ReplaceAll(address, parsedUrl.User.Username()+":"+password, parsedUrl.User.Username()+":"+ObfuscationString)
+		if parsedURL.User != nil {
+			if password, isSet := parsedURL.User.Password(); isSet {
+				cfg.GetDatabase().Addresses[i] = strings.ReplaceAll(address, parsedURL.User.Username()+":"+password, parsedURL.User.Username()+":"+ObfuscationString)
 			}
 		}
 	}
@@ -71,4 +71,23 @@ func (s *ConsoleServer) GetConfig(ctx context.Context, in *empty.Empty) (*consol
 		Warnings:      configWarnings,
 		ServerVersion: s.serverVersion,
 	}, nil
+}
+
+func (s *ConsoleServer) DeleteAllData(ctx context.Context, in *emptypb.Empty) (*emptypb.Empty, error) {
+	query := `TRUNCATE TABLE users, user_edge, user_device, user_tombstone, wallet_ledger, storage, purchase,
+			notification, message, leaderboard, leaderboard_record, groups, group_edge`
+	if _, err := s.db.ExecContext(ctx, query); err != nil {
+		s.logger.Debug("Could not cleanup data.", zap.Error(err))
+		return nil, status.Error(codes.Internal, "An error occurred while trying to truncate tables.")
+	}
+	// Setup System user
+	query = `INSERT INTO users (id, username)
+    VALUES ('00000000-0000-0000-0000-000000000000', '')
+    ON CONFLICT(id) DO NOTHING`
+	if _, err := s.db.ExecContext(ctx, query); err != nil {
+		s.logger.Debug("Error creating system user.", zap.Error(err))
+		return nil, status.Error(codes.Internal, "An error occurred while trying to setup the system user.")
+	}
+	s.logger.Info("All data cleaned up.")
+	return &emptypb.Empty{}, nil
 }

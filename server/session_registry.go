@@ -16,11 +16,15 @@ package server
 
 import (
 	"context"
-	"go.uber.org/atomic"
+	"github.com/heroiclabs/nakama-common/api"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"sync"
+	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/heroiclabs/nakama/rtapi"
+	"github.com/heroiclabs/nakama-common/rtapi"
+	"github.com/heroiclabs/nakama-common/runtime"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -35,8 +39,10 @@ type Session interface {
 	Logger() *zap.Logger
 	ID() uuid.UUID
 	UserID() uuid.UUID
+	Vars() map[string]string
 	ClientIP() string
 	ClientPort() string
+	Lang() string
 
 	Context() context.Context
 
@@ -44,13 +50,13 @@ type Session interface {
 	SetUsername(string)
 
 	Expiry() int64
-	Consume(func(logger *zap.Logger, session Session, envelope *rtapi.Envelope) bool)
+	Consume()
 
 	Format() SessionFormat
-	Send(isStream bool, mode uint8, envelope *rtapi.Envelope) error
-	SendBytes(isStream bool, mode uint8, payload []byte) error
+	Send(envelope *rtapi.Envelope, reliable bool) error
+	SendBytes(payload []byte, reliable bool) error
 
-	Close(reason string)
+	Close(msg string, reason runtime.PresenceReason, envelopes ...*rtapi.Envelope)
 }
 
 type SessionRegistry interface {
@@ -59,16 +65,21 @@ type SessionRegistry interface {
 	Get(sessionID uuid.UUID) Session
 	Add(session Session)
 	Remove(sessionID uuid.UUID)
-	Disconnect(ctx context.Context, sessionID uuid.UUID, node string) error
+	Disconnect(ctx context.Context, sessionID uuid.UUID, reason ...runtime.PresenceReason) error
+	SingleSession(ctx context.Context, tracker Tracker, userID, sessionID uuid.UUID)
 }
 
 type LocalSessionRegistry struct {
+	metrics Metrics
+
 	sessions     *sync.Map
 	sessionCount *atomic.Int32
 }
 
-func NewLocalSessionRegistry() SessionRegistry {
+func NewLocalSessionRegistry(metrics Metrics) SessionRegistry {
 	return &LocalSessionRegistry{
+		metrics: metrics,
+
 		sessions:     &sync.Map{},
 		sessionCount: atomic.NewInt32(0),
 	}
@@ -90,19 +101,55 @@ func (r *LocalSessionRegistry) Get(sessionID uuid.UUID) Session {
 
 func (r *LocalSessionRegistry) Add(session Session) {
 	r.sessions.Store(session.ID(), session)
-	r.sessionCount.Inc()
+	count := r.sessionCount.Inc()
+	r.metrics.GaugeSessions(float64(count))
 }
 
 func (r *LocalSessionRegistry) Remove(sessionID uuid.UUID) {
 	r.sessions.Delete(sessionID)
-	r.sessionCount.Dec()
+	count := r.sessionCount.Dec()
+	r.metrics.GaugeSessions(float64(count))
 }
 
-func (r *LocalSessionRegistry) Disconnect(ctx context.Context, sessionID uuid.UUID, node string) error {
+func (r *LocalSessionRegistry) Disconnect(ctx context.Context, sessionID uuid.UUID, reason ...runtime.PresenceReason) error {
 	session, ok := r.sessions.Load(sessionID)
 	if ok {
 		// No need to remove the session from the map, session.Close() will do that.
-		session.(Session).Close("server-side session disconnect")
+		reasonOverride := runtime.PresenceReasonDisconnect
+		if len(reason) > 0 {
+			reasonOverride = reason[0]
+		}
+		session.(Session).Close("server-side session disconnect", reasonOverride)
 	}
 	return nil
+}
+
+func (r *LocalSessionRegistry) SingleSession(ctx context.Context, tracker Tracker, userID, sessionID uuid.UUID) {
+	sessionIDs := tracker.ListLocalSessionIDByStream(PresenceStream{Mode: StreamModeNotifications, Subject: userID})
+	for _, foundSessionID := range sessionIDs {
+		if foundSessionID == sessionID {
+			// Allow the current session, only disconnect any older ones.
+			continue
+		}
+		session, ok := r.sessions.Load(foundSessionID)
+		if ok {
+			// No need to remove the session from the map, session.Close() will do that.
+			session.(Session).Close("server-side session disconnect", runtime.PresenceReasonDisconnect,
+				&rtapi.Envelope{Message: &rtapi.Envelope_Notifications{
+					Notifications: &rtapi.Notifications{
+						Notifications: []*api.Notification{
+							{
+								Id:         uuid.Must(uuid.NewV4()).String(),
+								Subject:    "single_socket",
+								Content:    "{}",
+								Code:       NotificationCodeSingleSocket,
+								SenderId:   "",
+								CreateTime: &timestamppb.Timestamp{Seconds: time.Now().Unix()},
+								Persistent: false,
+							},
+						},
+					},
+				}})
+		}
+	}
 }

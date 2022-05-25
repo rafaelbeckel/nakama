@@ -15,30 +15,50 @@
 package server
 
 import (
-	"go.uber.org/zap"
+	"context"
+	"errors"
 	"math/rand"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
 	"github.com/gofrs/uuid"
-	"github.com/heroiclabs/nakama/api"
-	"golang.org/x/net/context"
+	jwt "github.com/golang-jwt/jwt/v4"
+	"github.com/heroiclabs/nakama-common/api"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 var (
-	invalidCharsRegex = regexp.MustCompilePOSIX("([[:cntrl:]]|[[:space:]])+")
-	emailRegex        = regexp.MustCompile("^.+@.+\\..+$")
+	invalidUsernameRegex = regexp.MustCompilePOSIX("([[:cntrl:]]|[[\t\n\r\f\v]])+")
+	invalidCharsRegex    = regexp.MustCompilePOSIX("([[:cntrl:]]|[[:space:]])+")
+	emailRegex           = regexp.MustCompile("^.+@.+\\..+$")
 )
 
-func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.AuthenticateCustomRequest) (*api.Session, error) {
+type SessionTokenClaims struct {
+	UserId    string            `json:"uid,omitempty"`
+	Username  string            `json:"usn,omitempty"`
+	Vars      map[string]string `json:"vrs,omitempty"`
+	ExpiresAt int64             `json:"exp,omitempty"`
+}
+
+func (stc *SessionTokenClaims) Valid() error {
+	// Verify expiry.
+	if stc.ExpiresAt <= time.Now().UTC().Unix() {
+		vErr := new(jwt.ValidationError)
+		vErr.Inner = errors.New("Token is expired")
+		vErr.Errors |= jwt.ValidationErrorExpired
+		return vErr
+	}
+	return nil
+}
+
+func (s *ApiServer) AuthenticateApple(ctx context.Context, in *api.AuthenticateAppleRequest) (*api.Session, error) {
 	// Before hook.
-	if fn := s.runtime.BeforeAuthenticateCustom(); fn != nil {
+	if fn := s.runtime.BeforeAuthenticateApple(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, "", "", 0, clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -52,7 +72,73 @@ func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.Authenticate
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if s.config.GetSocial().Apple.BundleId == "" {
+		return nil, status.Error(codes.FailedPrecondition, "Apple authentication is not configured.")
+	}
+
+	if in.Account == nil || in.Account.Token == "" {
+		return nil, status.Error(codes.InvalidArgument, "Apple ID token is required.")
+	}
+
+	username := in.Username
+	if username == "" {
+		username = generateUsername()
+	} else if invalidUsernameRegex.MatchString(username) {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
+	} else if len(username) > 128 {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
+	}
+
+	create := in.Create == nil || in.Create.Value
+
+	dbUserID, dbUsername, created, err := AuthenticateApple(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().Apple.BundleId, in.Account.Token, username, create)
+	if err != nil {
+		return nil, err
+	}
+
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
+
+	// After hook.
+	if fn := s.runtime.AfterAuthenticateApple(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return session, nil
+}
+
+func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.AuthenticateCustomRequest) (*api.Session, error) {
+	// Before hook.
+	if fn := s.runtime.BeforeAuthenticateCustom(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -69,7 +155,7 @@ func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.Authenticate
 	username := in.Username
 	if username == "" {
 		username = generateUsername()
-	} else if invalidCharsRegex.MatchString(username) {
+	} else if invalidUsernameRegex.MatchString(username) {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
 	} else if len(username) > 128 {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
@@ -82,17 +168,19 @@ func (s *ApiServer) AuthenticateCustom(ctx context.Context, in *api.Authenticate
 		return nil, err
 	}
 
-	token, exp := generateToken(s.config, dbUserID, dbUsername)
-	session := &api.Session{Created: created, Token: token}
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateCustom(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -102,7 +190,7 @@ func (s *ApiServer) AuthenticateDevice(ctx context.Context, in *api.Authenticate
 	// Before hook.
 	if fn := s.runtime.BeforeAuthenticateDevice(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, "", "", 0, clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -116,7 +204,7 @@ func (s *ApiServer) AuthenticateDevice(ctx context.Context, in *api.Authenticate
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -133,7 +221,7 @@ func (s *ApiServer) AuthenticateDevice(ctx context.Context, in *api.Authenticate
 	username := in.Username
 	if username == "" {
 		username = generateUsername()
-	} else if invalidCharsRegex.MatchString(username) {
+	} else if invalidUsernameRegex.MatchString(username) {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
 	} else if len(username) > 128 {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
@@ -146,17 +234,19 @@ func (s *ApiServer) AuthenticateDevice(ctx context.Context, in *api.Authenticate
 		return nil, err
 	}
 
-	token, exp := generateToken(s.config, dbUserID, dbUsername)
-	session := &api.Session{Created: created, Token: token}
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateDevice(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -166,7 +256,7 @@ func (s *ApiServer) AuthenticateEmail(ctx context.Context, in *api.AuthenticateE
 	// Before hook.
 	if fn := s.runtime.BeforeAuthenticateEmail(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, "", "", 0, clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -180,7 +270,7 @@ func (s *ApiServer) AuthenticateEmail(ctx context.Context, in *api.AuthenticateE
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -204,7 +294,7 @@ func (s *ApiServer) AuthenticateEmail(ctx context.Context, in *api.AuthenticateE
 	}
 
 	if len(email.Password) < 8 {
-		return nil, status.Error(codes.InvalidArgument, "Password must be longer than 8 characters.")
+		return nil, status.Error(codes.InvalidArgument, "Password must be at least 8 characters long.")
 	}
 
 	username := in.Username
@@ -216,7 +306,7 @@ func (s *ApiServer) AuthenticateEmail(ctx context.Context, in *api.AuthenticateE
 
 		// Email address was supplied, we are allowed to generate a username.
 		username = generateUsername()
-	} else if invalidCharsRegex.MatchString(username) {
+	} else if invalidUsernameRegex.MatchString(username) {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
 	} else if len(username) > 128 {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
@@ -240,17 +330,19 @@ func (s *ApiServer) AuthenticateEmail(ctx context.Context, in *api.AuthenticateE
 		return nil, err
 	}
 
-	token, exp := generateToken(s.config, dbUserID, username)
-	session := &api.Session{Created: created, Token: token}
+	token, exp := generateToken(s.config, dbUserID, username, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, username, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateEmail(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, username, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, username, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -260,7 +352,7 @@ func (s *ApiServer) AuthenticateFacebook(ctx context.Context, in *api.Authentica
 	// Before hook.
 	if fn := s.runtime.BeforeAuthenticateFacebook(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, "", "", 0, clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -274,7 +366,7 @@ func (s *ApiServer) AuthenticateFacebook(ctx context.Context, in *api.Authentica
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -287,7 +379,7 @@ func (s *ApiServer) AuthenticateFacebook(ctx context.Context, in *api.Authentica
 	username := in.Username
 	if username == "" {
 		username = generateUsername()
-	} else if invalidCharsRegex.MatchString(username) {
+	} else if invalidUsernameRegex.MatchString(username) {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
 	} else if len(username) > 128 {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
@@ -295,37 +387,39 @@ func (s *ApiServer) AuthenticateFacebook(ctx context.Context, in *api.Authentica
 
 	create := in.Create == nil || in.Create.Value
 
-	dbUserID, dbUsername, created, err := AuthenticateFacebook(ctx, s.logger, s.db, s.socialClient, in.Account.Token, username, create)
+	dbUserID, dbUsername, created, importFriendsPossible, err := AuthenticateFacebook(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().FacebookLimitedLogin.AppId, in.Account.Token, username, create)
 	if err != nil {
 		return nil, err
 	}
 
 	// Import friends if requested.
-	if in.Sync == nil || in.Sync.Value {
-		importFacebookFriends(ctx, s.logger, s.db, s.router, s.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, in.Account.Token, false)
+	if in.Sync != nil && in.Sync.Value && importFriendsPossible {
+		_ = importFacebookFriends(ctx, s.logger, s.db, s.router, s.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, in.Account.Token, false)
 	}
 
-	token, exp := generateToken(s.config, dbUserID, dbUsername)
-	session := &api.Session{Created: created, Token: token}
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateFacebook(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
 }
 
-func (s *ApiServer) AuthenticateGameCenter(ctx context.Context, in *api.AuthenticateGameCenterRequest) (*api.Session, error) {
+func (s *ApiServer) AuthenticateFacebookInstantGame(ctx context.Context, in *api.AuthenticateFacebookInstantGameRequest) (*api.Session, error) {
 	// Before hook.
-	if fn := s.runtime.BeforeAuthenticateGameCenter(); fn != nil {
+	if fn := s.runtime.BeforeAuthenticateFacebookInstantGame(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, "", "", 0, clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -339,7 +433,68 @@ func (s *ApiServer) AuthenticateGameCenter(ctx context.Context, in *api.Authenti
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if in.Account == nil || in.Account.SignedPlayerInfo == "" {
+		return nil, status.Error(codes.InvalidArgument, "Signed Player Info for a Facebook Instant Game is required.")
+	}
+
+	username := in.Username
+	if username == "" {
+		username = generateUsername()
+	} else if invalidUsernameRegex.MatchString(username) {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
+	} else if len(username) > 128 {
+		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
+	}
+
+	create := in.Create == nil || in.Create.Value
+
+	dbUserID, dbUsername, created, err := AuthenticateFacebookInstantGame(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().FacebookInstantGame.AppSecret, in.Account.SignedPlayerInfo, username, create)
+	if err != nil {
+		return nil, err
+	}
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
+
+	// After hook.
+	if fn := s.runtime.AfterAuthenticateFacebookInstantGame(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return session, nil
+}
+
+func (s *ApiServer) AuthenticateGameCenter(ctx context.Context, in *api.AuthenticateGameCenterRequest) (*api.Session, error) {
+	// Before hook.
+	if fn := s.runtime.BeforeAuthenticateGameCenter(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -364,7 +519,7 @@ func (s *ApiServer) AuthenticateGameCenter(ctx context.Context, in *api.Authenti
 	username := in.Username
 	if username == "" {
 		username = generateUsername()
-	} else if invalidCharsRegex.MatchString(username) {
+	} else if invalidUsernameRegex.MatchString(username) {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
 	} else if len(username) > 128 {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
@@ -377,17 +532,19 @@ func (s *ApiServer) AuthenticateGameCenter(ctx context.Context, in *api.Authenti
 		return nil, err
 	}
 
-	token, exp := generateToken(s.config, dbUserID, dbUsername)
-	session := &api.Session{Created: created, Token: token}
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateGameCenter(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -397,7 +554,7 @@ func (s *ApiServer) AuthenticateGoogle(ctx context.Context, in *api.Authenticate
 	// Before hook.
 	if fn := s.runtime.BeforeAuthenticateGoogle(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, "", "", 0, clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -411,7 +568,7 @@ func (s *ApiServer) AuthenticateGoogle(ctx context.Context, in *api.Authenticate
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -424,7 +581,7 @@ func (s *ApiServer) AuthenticateGoogle(ctx context.Context, in *api.Authenticate
 	username := in.Username
 	if username == "" {
 		username = generateUsername()
-	} else if invalidCharsRegex.MatchString(username) {
+	} else if invalidUsernameRegex.MatchString(username) {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
 	} else if len(username) > 128 {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
@@ -437,17 +594,19 @@ func (s *ApiServer) AuthenticateGoogle(ctx context.Context, in *api.Authenticate
 		return nil, err
 	}
 
-	token, exp := generateToken(s.config, dbUserID, dbUsername)
-	session := &api.Session{Created: created, Token: token}
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateGoogle(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
@@ -457,7 +616,7 @@ func (s *ApiServer) AuthenticateSteam(ctx context.Context, in *api.AuthenticateS
 	// Before hook.
 	if fn := s.runtime.BeforeAuthenticateSteam(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, "", "", 0, clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, "", "", nil, 0, clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -471,7 +630,7 @@ func (s *ApiServer) AuthenticateSteam(ctx context.Context, in *api.AuthenticateS
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -488,7 +647,7 @@ func (s *ApiServer) AuthenticateSteam(ctx context.Context, in *api.AuthenticateS
 	username := in.Username
 	if username == "" {
 		username = generateUsername()
-	} else if invalidCharsRegex.MatchString(username) {
+	} else if invalidUsernameRegex.MatchString(username) {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, no spaces or control characters allowed.")
 	} else if len(username) > 128 {
 		return nil, status.Error(codes.InvalidArgument, "Username invalid, must be 1-128 bytes.")
@@ -496,39 +655,52 @@ func (s *ApiServer) AuthenticateSteam(ctx context.Context, in *api.AuthenticateS
 
 	create := in.Create == nil || in.Create.Value
 
-	dbUserID, dbUsername, created, err := AuthenticateSteam(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().Steam.AppID, s.config.GetSocial().Steam.PublisherKey, in.Account.Token, username, create)
+	dbUserID, dbUsername, steamID, created, err := AuthenticateSteam(ctx, s.logger, s.db, s.socialClient, s.config.GetSocial().Steam.AppID, s.config.GetSocial().Steam.PublisherKey, in.Account.Token, username, create)
 	if err != nil {
 		return nil, err
 	}
 
-	token, exp := generateToken(s.config, dbUserID, dbUsername)
-	session := &api.Session{Created: created, Token: token}
+	// Import friends if requested.
+	if in.Sync != nil && in.Sync.Value {
+		_ = importSteamFriends(ctx, s.logger, s.db, s.router, s.socialClient, uuid.FromStringOrNil(dbUserID), dbUsername, s.config.GetSocial().Steam.PublisherKey, steamID, false)
+	}
+
+	token, exp := generateToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	refreshToken, refreshExp := generateRefreshToken(s.config, dbUserID, dbUsername, in.Account.Vars)
+	s.sessionCache.Add(uuid.FromStringOrNil(dbUserID), exp, token, refreshExp, refreshToken)
+	session := &api.Session{Created: created, Token: token, RefreshToken: refreshToken}
 
 	// After hook.
 	if fn := s.runtime.AfterAuthenticateSteam(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, dbUserID, dbUsername, exp, clientIP, clientPort, session, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, dbUserID, dbUsername, in.Account.Vars, exp, clientIP, clientPort, session, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return session, nil
 }
 
-func generateToken(config Config, userID, username string) (string, int64) {
+func generateToken(config Config, userID, username string, vars map[string]string) (string, int64) {
 	exp := time.Now().UTC().Add(time.Duration(config.GetSession().TokenExpirySec) * time.Second).Unix()
-	return generateTokenWithExpiry(config, userID, username, exp)
+	return generateTokenWithExpiry(config.GetSession().EncryptionKey, userID, username, vars, exp)
 }
 
-func generateTokenWithExpiry(config Config, userID, username string, exp int64) (string, int64) {
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"uid": userID,
-		"exp": exp,
-		"usn": username,
+func generateRefreshToken(config Config, userID string, username string, vars map[string]string) (string, int64) {
+	exp := time.Now().UTC().Add(time.Duration(config.GetSession().RefreshTokenExpirySec) * time.Second).Unix()
+	return generateTokenWithExpiry(config.GetSession().RefreshEncryptionKey, userID, username, vars, exp)
+}
+
+func generateTokenWithExpiry(signingKey, userID, username string, vars map[string]string, exp int64) (string, int64) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, &SessionTokenClaims{
+		UserId:    userID,
+		Username:  username,
+		Vars:      vars,
+		ExpiresAt: exp,
 	})
-	signedToken, _ := token.SignedString([]byte(config.GetSession().EncryptionKey))
+	signedToken, _ := token.SignedString([]byte(signingKey))
 	return signedToken, exp
 }
 

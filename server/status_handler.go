@@ -16,9 +16,10 @@ package server
 
 import (
 	"context"
-	"github.com/heroiclabs/nakama/console"
-	"go.uber.org/zap"
 	"runtime"
+
+	"github.com/heroiclabs/nakama/v3/console"
+	"go.uber.org/zap"
 )
 
 type StatusHandler interface {
@@ -30,34 +31,34 @@ type LocalStatusHandler struct {
 	sessionRegistry SessionRegistry
 	matchRegistry   MatchRegistry
 	tracker         Tracker
-	metricsExporter *MetricsExporter
+	metrics         Metrics
 	node            string
 }
 
-func NewLocalStatusHandler(logger *zap.Logger, sessionRegistry SessionRegistry, matchRegistry MatchRegistry, tracker Tracker, metricsExporter *MetricsExporter, node string) StatusHandler {
+func NewLocalStatusHandler(logger *zap.Logger, sessionRegistry SessionRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, node string) StatusHandler {
 	return &LocalStatusHandler{
 		logger:          logger,
 		sessionRegistry: sessionRegistry,
 		matchRegistry:   matchRegistry,
 		tracker:         tracker,
-		metricsExporter: metricsExporter,
+		metrics:         metrics,
 		node:            node,
 	}
 }
 
 func (s *LocalStatusHandler) GetStatus(ctx context.Context) ([]*console.StatusList_Status, error) {
 	return []*console.StatusList_Status{
-		&console.StatusList_Status{
+		{
 			Name:           s.node,
-			Health:         0,
+			Health:         console.StatusHealth_STATUS_HEALTH_OK,
 			SessionCount:   int32(s.sessionRegistry.Count()),
 			PresenceCount:  int32(s.tracker.Count()),
 			MatchCount:     int32(s.matchRegistry.Count()),
 			GoroutineCount: int32(runtime.NumGoroutine()),
-			AvgLatencyMs:   s.metricsExporter.Latency.Load(),
-			AvgRateSec:     s.metricsExporter.Rate.Load(),
-			AvgInputKbs:    s.metricsExporter.Input.Load(),
-			AvgOutputKbs:   s.metricsExporter.Output.Load(),
+			AvgLatencyMs:   s.metrics.SnapshotLatencyMs(),
+			AvgRateSec:     s.metrics.SnapshotRateSec(),
+			AvgInputKbs:    s.metrics.SnapshotRecvKbSec(),
+			AvgOutputKbs:   s.metrics.SnapshotSentKbSec(),
 		},
 	}, nil
 }

@@ -15,11 +15,10 @@
 package server
 
 import (
-	"bytes"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	"github.com/heroiclabs/nakama/rtapi"
+	"github.com/heroiclabs/nakama-common/rtapi"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // Deferred message expected to be batched with other deferred messages.
@@ -27,37 +26,38 @@ import (
 type DeferredMessage struct {
 	PresenceIDs []*PresenceID
 	Envelope    *rtapi.Envelope
+	Reliable    bool
 }
 
 // MessageRouter is responsible for sending a message to a list of presences or to an entire stream.
 type MessageRouter interface {
-	SendToPresenceIDs(*zap.Logger, []*PresenceID, bool, uint8, *rtapi.Envelope)
-	SendToStream(*zap.Logger, PresenceStream, *rtapi.Envelope)
-	SendDeferred(*zap.Logger, bool, uint8, []*DeferredMessage)
+	SendToPresenceIDs(*zap.Logger, []*PresenceID, *rtapi.Envelope, bool)
+	SendToStream(*zap.Logger, PresenceStream, *rtapi.Envelope, bool)
+	SendDeferred(*zap.Logger, []*DeferredMessage)
 }
 
 type LocalMessageRouter struct {
-	jsonpbMarshaler *jsonpb.Marshaler
-	sessionRegistry SessionRegistry
-	tracker         Tracker
+	protojsonMarshaler *protojson.MarshalOptions
+	sessionRegistry    SessionRegistry
+	tracker            Tracker
 }
 
-func NewLocalMessageRouter(sessionRegistry SessionRegistry, tracker Tracker, jsonpbMarshaler *jsonpb.Marshaler) MessageRouter {
+func NewLocalMessageRouter(sessionRegistry SessionRegistry, tracker Tracker, protojsonMarshaler *protojson.MarshalOptions) MessageRouter {
 	return &LocalMessageRouter{
-		jsonpbMarshaler: jsonpbMarshaler,
-		sessionRegistry: sessionRegistry,
-		tracker:         tracker,
+		protojsonMarshaler: protojsonMarshaler,
+		sessionRegistry:    sessionRegistry,
+		tracker:            tracker,
 	}
 }
 
-func (r *LocalMessageRouter) SendToPresenceIDs(logger *zap.Logger, presenceIDs []*PresenceID, isStream bool, mode uint8, envelope *rtapi.Envelope) {
+func (r *LocalMessageRouter) SendToPresenceIDs(logger *zap.Logger, presenceIDs []*PresenceID, envelope *rtapi.Envelope, reliable bool) {
 	if len(presenceIDs) == 0 {
 		return
 	}
 
 	// Prepare payload variables but do not initialize until we hit a session that needs them to avoid unnecessary work.
 	var payloadProtobuf []byte
-	var payloadJson []byte
+	var payloadJSON []byte
 
 	for _, presenceID := range presenceIDs {
 		session := r.sessionRegistry.Get(presenceID.SessionID)
@@ -77,21 +77,20 @@ func (r *LocalMessageRouter) SendToPresenceIDs(logger *zap.Logger, presenceIDs [
 					return
 				}
 			}
-			err = session.SendBytes(isStream, mode, payloadProtobuf)
+			err = session.SendBytes(payloadProtobuf, reliable)
 		case SessionFormatJson:
 			fallthrough
 		default:
-			if payloadJson == nil {
+			if payloadJSON == nil {
 				// Marshal the payload now that we know this format is needed.
-				var buf bytes.Buffer
-				if err = r.jsonpbMarshaler.Marshal(&buf, envelope); err == nil {
-					payloadJson = buf.Bytes()
+				if buf, err := r.protojsonMarshaler.Marshal(envelope); err == nil {
+					payloadJSON = buf
 				} else {
 					logger.Error("Could not marshal message", zap.Error(err))
 					return
 				}
 			}
-			err = session.SendBytes(isStream, mode, payloadJson)
+			err = session.SendBytes(payloadJSON, reliable)
 		}
 		if err != nil {
 			logger.Error("Failed to route message", zap.String("sid", presenceID.SessionID.String()), zap.Error(err))
@@ -99,13 +98,13 @@ func (r *LocalMessageRouter) SendToPresenceIDs(logger *zap.Logger, presenceIDs [
 	}
 }
 
-func (r *LocalMessageRouter) SendToStream(logger *zap.Logger, stream PresenceStream, envelope *rtapi.Envelope) {
+func (r *LocalMessageRouter) SendToStream(logger *zap.Logger, stream PresenceStream, envelope *rtapi.Envelope, reliable bool) {
 	presenceIDs := r.tracker.ListPresenceIDByStream(stream)
-	r.SendToPresenceIDs(logger, presenceIDs, true, stream.Mode, envelope)
+	r.SendToPresenceIDs(logger, presenceIDs, envelope, reliable)
 }
 
-func (r *LocalMessageRouter) SendDeferred(logger *zap.Logger, isStream bool, mode uint8, messages []*DeferredMessage) {
+func (r *LocalMessageRouter) SendDeferred(logger *zap.Logger, messages []*DeferredMessage) {
 	for _, message := range messages {
-		r.SendToPresenceIDs(logger, message.PresenceIDs, isStream, mode, message.Envelope)
+		r.SendToPresenceIDs(logger, message.PresenceIDs, message.Envelope, message.Reliable)
 	}
 }

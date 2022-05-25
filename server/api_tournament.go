@@ -20,26 +20,26 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
+	"github.com/heroiclabs/nakama-common/runtime"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/empty"
-	"github.com/golang/protobuf/ptypes/wrappers"
-	"github.com/heroiclabs/nakama/api"
+	"github.com/heroiclabs/nakama-common/api"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRequest) (*empty.Empty, error) {
+func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 	username := ctx.Value(ctxUsernameKey{}).(string)
 
 	// Before hook.
 	if fn := s.runtime.BeforeJoinTournament(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -53,20 +53,20 @@ func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRe
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	tournamentId := in.GetTournamentId()
+	tournamentID := in.GetTournamentId()
 
-	if err := TournamentJoin(ctx, s.logger, s.db, s.leaderboardCache, userID.String(), username, tournamentId); err != nil {
-		if err == ErrTournamentNotFound {
+	if err := TournamentJoin(ctx, s.logger, s.db, s.leaderboardCache, userID.String(), username, tournamentID); err != nil {
+		if err == runtime.ErrTournamentNotFound {
 			return nil, status.Error(codes.NotFound, "Tournament not found.")
-		} else if err == ErrTournamentMaxSizeReached {
+		} else if err == runtime.ErrTournamentMaxSizeReached {
 			return nil, status.Error(codes.InvalidArgument, "Tournament cannot be joined as it has reached its max size.")
-		} else if err == ErrTournamentOutsideDuration {
+		} else if err == runtime.ErrTournamentOutsideDuration {
 			return nil, status.Error(codes.InvalidArgument, "Tournament is not active and cannot accept new joins.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to join tournament.")
@@ -74,22 +74,22 @@ func (s *ApiServer) JoinTournament(ctx context.Context, in *api.JoinTournamentRe
 
 	// After hook.
 	if fn := s.runtime.AfterJoinTournament(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func (s *ApiServer) ListTournamentRecords(ctx context.Context, in *api.ListTournamentRecordsRequest) (*api.TournamentRecordList, error) {
 	// Before hook.
 	if fn := s.runtime.BeforeListTournamentRecords(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -103,7 +103,7 @@ func (s *ApiServer) ListTournamentRecords(ctx context.Context, in *api.ListTourn
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -113,73 +113,58 @@ func (s *ApiServer) ListTournamentRecords(ctx context.Context, in *api.ListTourn
 		return nil, status.Error(codes.InvalidArgument, "Tournament ID must be provided")
 	}
 
-	tournament := s.leaderboardCache.Get(in.GetTournamentId())
-	if tournament == nil {
-		return nil, status.Error(codes.NotFound, "Tournament not found.")
-	}
-
-	overrideExpiry := int64(0)
-	if in.Expiry != nil {
-		overrideExpiry = in.Expiry.Value
-	} else {
-		if tournament.EndTime > 0 && tournament.EndTime <= time.Now().UTC().Unix() {
-			return nil, status.Error(codes.NotFound, "Tournament not found or has ended.")
-		}
-	}
-
-	var limit *wrappers.Int32Value
-	if in.GetLimit() != nil {
-		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
-			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
-		}
-		limit = in.GetLimit()
-	} else if len(in.GetOwnerIds()) == 0 || in.GetCursor() != "" {
-		limit = &wrappers.Int32Value{Value: 1}
-	}
-
 	if len(in.GetOwnerIds()) != 0 {
-		for _, ownerId := range in.OwnerIds {
-			if _, err := uuid.FromString(ownerId); err != nil {
+		for _, ownerID := range in.OwnerIds {
+			if _, err := uuid.FromString(ownerID); err != nil {
 				return nil, status.Error(codes.InvalidArgument, "One or more owner IDs are invalid.")
 			}
 		}
 	}
 
-	records, err := LeaderboardRecordsList(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetTournamentId(), limit, in.GetCursor(), in.GetOwnerIds(), overrideExpiry)
-	if err == ErrLeaderboardNotFound {
+	var limit *wrapperspb.Int32Value
+	if in.GetLimit() != nil {
+		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
+		}
+		limit = in.GetLimit()
+	} else if len(in.GetOwnerIds()) == 0 || in.GetCursor() == "" {
+		limit = &wrapperspb.Int32Value{Value: 10}
+	}
+
+	overrideExpiry := int64(0)
+	if in.Expiry != nil {
+		overrideExpiry = in.Expiry.Value
+	}
+
+	recordList, err := TournamentRecordsList(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetTournamentId(), in.OwnerIds, limit, in.Cursor, overrideExpiry)
+	if err == runtime.ErrTournamentNotFound {
 		return nil, status.Error(codes.NotFound, "Tournament not found.")
+	} else if err == runtime.ErrTournamentOutsideDuration {
+		return nil, status.Error(codes.NotFound, "Tournament has ended.")
 	} else if err == ErrLeaderboardInvalidCursor {
 		return nil, status.Error(codes.InvalidArgument, "Cursor is invalid or expired.")
 	} else if err != nil {
 		return nil, status.Error(codes.Internal, "Error listing records from tournament.")
 	}
 
-	recordList := &api.TournamentRecordList{
-		Records:      records.Records,
-		OwnerRecords: records.OwnerRecords,
-		NextCursor:   records.NextCursor,
-		PrevCursor:   records.PrevCursor,
-	}
-
 	// After hook.
 	if fn := s.runtime.AfterListTournamentRecords(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, recordList, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, recordList, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return recordList, nil
-
 }
 
 func (s *ApiServer) ListTournaments(ctx context.Context, in *api.ListTournamentsRequest) (*api.TournamentList, error) {
 	// Before hook.
 	if fn := s.runtime.BeforeListTournaments(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -193,22 +178,22 @@ func (s *ApiServer) ListTournaments(ctx context.Context, in *api.ListTournaments
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	var incomingCursor *tournamentListCursor
+	var incomingCursor *TournamentListCursor
 
 	if in.GetCursor() != "" {
-		if cb, err := base64.StdEncoding.DecodeString(in.GetCursor()); err != nil {
+		cb, err := base64.StdEncoding.DecodeString(in.GetCursor())
+		if err != nil {
 			return nil, ErrLeaderboardInvalidCursor
-		} else {
-			incomingCursor = &tournamentListCursor{}
-			if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
-				return nil, ErrLeaderboardInvalidCursor
-			}
+		}
+		incomingCursor = &TournamentListCursor{}
+		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
+			return nil, ErrLeaderboardInvalidCursor
 		}
 	}
 
@@ -228,20 +213,21 @@ func (s *ApiServer) ListTournaments(ctx context.Context, in *api.ListTournaments
 		}
 	}
 
+	// If startTime and endTime are both not set the API will only return active or future tournaments.
 	startTime := -1 // don't include start time in query
 	if in.GetStartTime() != nil {
 		startTime = int(in.GetStartTime().GetValue())
 	}
 
-	endTime := int(time.Now().UTC().AddDate(1, 0, 0).Unix()) // one year from now
+	endTime := -1 // don't include end time in query
 	if in.GetEndTime() != nil {
 		endTime = int(in.GetEndTime().GetValue())
-		if endTime < startTime {
+		if endTime != 0 && endTime < startTime { // Allow 0 value to explicitly request tournaments with no end time set.
 			return nil, status.Error(codes.InvalidArgument, "Tournament end time must be greater than start time.")
 		}
 	}
 
-	limit := 1
+	limit := 100
 	if in.GetLimit() != nil {
 		limit = int(in.GetLimit().GetValue())
 		if limit < 1 || limit > 100 {
@@ -249,19 +235,19 @@ func (s *ApiServer) ListTournaments(ctx context.Context, in *api.ListTournaments
 		}
 	}
 
-	records, err := TournamentList(ctx, s.logger, s.db, categoryStart, categoryEnd, startTime, endTime, limit, incomingCursor)
+	records, err := TournamentList(ctx, s.logger, s.db, s.leaderboardCache, categoryStart, categoryEnd, startTime, endTime, limit, incomingCursor)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "Error listing tournaments.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterListTournaments(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, records, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, records, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return records, nil
@@ -274,7 +260,7 @@ func (s *ApiServer) WriteTournamentRecord(ctx context.Context, in *api.WriteTour
 	// Before hook.
 	if fn := s.runtime.BeforeWriteTournamentRecord(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -288,23 +274,18 @@ func (s *ApiServer) WriteTournamentRecord(ctx context.Context, in *api.WriteTour
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	if in.GetTournamentId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "Tournament ID must be provided")
-	}
-
-	if in.GetTournamentId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "Invalid tournament ID.")
+		return nil, status.Error(codes.InvalidArgument, "Tournament ID must be provided.")
 	} else if in.GetRecord() == nil {
 		return nil, status.Error(codes.InvalidArgument, "Invalid input, record score value is required.")
 	} else if in.GetRecord().GetMetadata() != "" {
-		var maybeJSON map[string]interface{}
-		if json.Unmarshal([]byte(in.GetRecord().GetMetadata()), &maybeJSON) != nil {
+		if maybeJSON := []byte(in.GetRecord().GetMetadata()); !json.Valid(maybeJSON) || bytes.TrimSpace(maybeJSON)[0] != byteBracket {
 			return nil, status.Error(codes.InvalidArgument, "Metadata value must be JSON, if provided.")
 		}
 	}
@@ -318,16 +299,18 @@ func (s *ApiServer) WriteTournamentRecord(ctx context.Context, in *api.WriteTour
 		return nil, status.Error(codes.NotFound, "Tournament not found or has ended.")
 	}
 
-	record, err := TournamentRecordWrite(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetTournamentId(), userID, username, in.GetRecord().GetScore(), in.GetRecord().GetSubscore(), in.GetRecord().GetMetadata())
+	record, err := TournamentRecordWrite(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, userID, in.GetTournamentId(), userID, username, in.GetRecord().GetScore(), in.GetRecord().GetSubscore(), in.GetRecord().GetMetadata(), in.GetRecord().GetOperator())
 	if err != nil {
-		if err == ErrTournamentMaxSizeReached {
-			return nil, status.Error(codes.InvalidArgument, "Tournament has reached max size.")
-		} else if err == ErrTournamentWriteMaxNumScoreReached {
-			return nil, status.Error(codes.InvalidArgument, "Reached allowed max number of score attempts.")
-		} else if err == ErrTournamentWriteJoinRequired {
-			return nil, status.Error(codes.InvalidArgument, "Must join tournament before attempting to write value.")
-		} else if err == ErrTournamentOutsideDuration {
-			return nil, status.Error(codes.InvalidArgument, "Tournament is not active and cannot accept new scores.")
+		if err == runtime.ErrTournamentMaxSizeReached {
+			return nil, status.Error(codes.FailedPrecondition, "Tournament has reached max size.")
+		} else if err == runtime.ErrTournamentAuthoritative {
+			return nil, status.Error(codes.PermissionDenied, "Tournament only allows authoritative score submissions.")
+		} else if err == runtime.ErrTournamentWriteMaxNumScoreReached {
+			return nil, status.Error(codes.FailedPrecondition, "Reached allowed max number of score attempts.")
+		} else if err == runtime.ErrTournamentWriteJoinRequired {
+			return nil, status.Error(codes.FailedPrecondition, "Must join tournament before attempting to write value.")
+		} else if err == runtime.ErrTournamentOutsideDuration {
+			return nil, status.Error(codes.FailedPrecondition, "Tournament is not active and cannot accept new scores.")
 		} else {
 			return nil, status.Error(codes.Internal, "Error writing score to tournament.")
 		}
@@ -335,12 +318,12 @@ func (s *ApiServer) WriteTournamentRecord(ctx context.Context, in *api.WriteTour
 
 	// After hook.
 	if fn := s.runtime.AfterWriteTournamentRecord(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, record, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, record, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return record, nil
@@ -350,7 +333,7 @@ func (s *ApiServer) ListTournamentRecordsAroundOwner(ctx context.Context, in *ap
 	// Before hook.
 	if fn := s.runtime.BeforeListTournamentRecordsAroundOwner(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -364,7 +347,7 @@ func (s *ApiServer) ListTournamentRecordsAroundOwner(ctx context.Context, in *ap
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -374,7 +357,7 @@ func (s *ApiServer) ListTournamentRecordsAroundOwner(ctx context.Context, in *ap
 		return nil, status.Error(codes.InvalidArgument, "Invalid tournament ID.")
 	}
 
-	limit := 1
+	limit := 100
 	if in.GetLimit() != nil {
 		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
 			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
@@ -386,7 +369,7 @@ func (s *ApiServer) ListTournamentRecordsAroundOwner(ctx context.Context, in *ap
 		return nil, status.Error(codes.InvalidArgument, "Owner ID must be provided for a haystack query.")
 	}
 
-	ownerId, err := uuid.FromString(in.GetOwnerId())
+	ownerID, err := uuid.FromString(in.GetOwnerId())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "Invalid owner ID provided.")
 	}
@@ -396,7 +379,7 @@ func (s *ApiServer) ListTournamentRecordsAroundOwner(ctx context.Context, in *ap
 		overrideExpiry = in.Expiry.Value
 	}
 
-	records, err := TournamentRecordsHaystack(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetTournamentId(), ownerId, limit, overrideExpiry)
+	records, err := TournamentRecordsHaystack(ctx, s.logger, s.db, s.leaderboardCache, s.leaderboardRankCache, in.GetTournamentId(), ownerID, limit, overrideExpiry)
 	if err == ErrLeaderboardNotFound {
 		return nil, status.Error(codes.NotFound, "Tournament not found.")
 	} else if err != nil {
@@ -407,12 +390,12 @@ func (s *ApiServer) ListTournamentRecordsAroundOwner(ctx context.Context, in *ap
 
 	// After hook.
 	if fn := s.runtime.AfterListTournamentRecordsAroundOwner(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, list, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, list, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return list, nil

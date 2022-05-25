@@ -17,17 +17,20 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/golang/protobuf/jsonpb"
-	"go.uber.org/atomic"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/heroiclabs/nakama/rtapi"
-	"github.com/heroiclabs/nakama/social"
-	"github.com/yuin/gopher-lua"
+	"github.com/heroiclabs/nakama-common/rtapi"
+	lua "github.com/heroiclabs/nakama/v3/internal/gopher-lua"
+	"github.com/heroiclabs/nakama/v3/social"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 type RuntimeLuaMatchCore struct {
@@ -38,11 +41,15 @@ type RuntimeLuaMatchCore struct {
 	deferMessageFn RuntimeMatchDeferMessageFunction
 	presenceList   *MatchPresenceList
 
-	id     uuid.UUID
-	node   string
-	idStr  string
-	stream PresenceStream
-	label  *atomic.String
+	id         uuid.UUID
+	node       string
+	module     string
+	tickRate   int
+	createTime int64
+	stopped    *atomic.Bool
+	idStr      string
+	stream     PresenceStream
+	label      *atomic.String
 
 	vm            *lua.LState
 	initFn        lua.LValue
@@ -51,46 +58,52 @@ type RuntimeLuaMatchCore struct {
 	leaveFn       lua.LValue
 	loopFn        lua.LValue
 	terminateFn   lua.LValue
+	signalFn      lua.LValue
 	ctx           *lua.LTable
 	dispatcher    *lua.LTable
 
 	ctxCancelFn context.CancelFunc
 }
 
-func NewRuntimeLuaMatchCore(logger *zap.Logger, db *sql.DB, jsonpbUnmarshaler *jsonpb.Unmarshaler, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, matchRegistry MatchRegistry, tracker Tracker, streamManager StreamManager, router MessageRouter, stdLibs map[string]lua.LGFunction, once *sync.Once, localCache *RuntimeLuaLocalCache, goMatchCreateFn RuntimeMatchCreateFunction, id uuid.UUID, node string, name string) (RuntimeMatchCore, error) {
+func NewRuntimeLuaMatchCore(logger *zap.Logger, module string, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry *StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, stdLibs map[string]lua.LGFunction, once *sync.Once, localCache *RuntimeLuaLocalCache, eventFn RuntimeEventCustomFunction, sharedReg, sharedGlobals *lua.LTable, id uuid.UUID, node string, stopped *atomic.Bool, name string, matchProvider *MatchProvider) (RuntimeMatchCore, error) {
 	// Set up the Lua VM that will handle this match.
 	vm := lua.NewState(lua.Options{
-		CallStackSize:       config.GetRuntime().CallStackSize,
-		RegistrySize:        config.GetRuntime().RegistrySize,
+		CallStackSize:       config.GetRuntime().GetLuaCallStackSize(),
+		RegistrySize:        config.GetRuntime().GetLuaRegistrySize(),
 		SkipOpenLibs:        true,
 		IncludeGoStackTrace: true,
 	})
 	goCtx, ctxCancelFn := context.WithCancel(context.Background())
 	vm.SetContext(goCtx)
-	for name, lib := range stdLibs {
-		vm.Push(vm.NewFunction(lib))
-		vm.Push(lua.LString(name))
-		vm.Call(1, 0)
-	}
 
-	allMatchCreateFn := func(ctx context.Context, logger *zap.Logger, id uuid.UUID, node string, name string) (RuntimeMatchCore, error) {
-		core, err := goMatchCreateFn(ctx, logger, id, node, name)
-		if err != nil {
-			return nil, err
-		}
-		if core != nil {
-			return core, nil
-		}
-		return NewRuntimeLuaMatchCore(logger, db, jsonpbUnmarshaler, config, socialClient, leaderboardCache, rankCache, leaderboardScheduler, sessionRegistry, matchRegistry, tracker, streamManager, router, stdLibs, once, localCache, goMatchCreateFn, id, node, name)
-	}
+	// Check if read-only globals are provided.
+	if sharedReg != nil && sharedGlobals != nil {
+		// Running with read-only globals.
+		vm.Get(lua.GlobalsIndex).(*lua.LTable).Metatable = sharedGlobals
 
-	nakamaModule := NewRuntimeLuaNakamaModule(logger, db, jsonpbUnmarshaler, config, socialClient, leaderboardCache, rankCache, leaderboardScheduler, sessionRegistry, matchRegistry, tracker, streamManager, router, once, localCache, allMatchCreateFn, nil, nil)
-	vm.PreloadModule("nakama", nakamaModule.Loader)
+		stateRegistry := vm.Get(lua.RegistryIndex).(*lua.LTable)
+		stateRegistry.Metatable = sharedReg
+
+		loadedTable := vm.NewTable()
+		loadedTable.Metatable = vm.GetField(stateRegistry, "_LOADED")
+		vm.SetField(stateRegistry, "_LOADED", loadedTable)
+	} else {
+		// Creating a completely new VM with its own globals.
+		for name, lib := range stdLibs {
+			vm.Push(vm.NewFunction(lib))
+			vm.Push(lua.LString(name))
+			vm.Call(1, 0)
+		}
+
+		nakamaModule := NewRuntimeLuaNakamaModule(logger, db, protojsonMarshaler, protojsonUnmarshaler, config, socialClient, leaderboardCache, rankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, tracker, metrics, streamManager, router, once, localCache, matchProvider.CreateMatch, eventFn, nil, nil)
+		vm.PreloadModule("nakama", nakamaModule.Loader)
+	}
 
 	// Create the context to be used throughout this match.
-	ctx := vm.CreateTable(0, 6)
+	ctx := vm.CreateTable(0, 7)
 	ctx.RawSetString(__RUNTIME_LUA_CTX_ENV, RuntimeLuaConvertMapString(vm, config.GetRuntime().Environment))
 	ctx.RawSetString(__RUNTIME_LUA_CTX_MODE, lua.LString(RuntimeExecutionModeMatch.String()))
+	ctx.RawSetString(__RUNTIME_LUA_CTX_NODE, lua.LString(node))
 	ctx.RawSetString(__RUNTIME_LUA_CTX_MATCH_ID, lua.LString(fmt.Sprintf("%v.%v", id.String(), node)))
 	ctx.RawSetString(__RUNTIME_LUA_CTX_MATCH_NODE, lua.LString(node))
 
@@ -98,18 +111,24 @@ func NewRuntimeLuaMatchCore(logger *zap.Logger, db *sql.DB, jsonpbUnmarshaler *j
 	req := vm.GetGlobal("require").(*lua.LFunction)
 	err := vm.GPCall(req.GFunction, lua.LString(name))
 	if err != nil {
+		if apiErr, ok := err.(*lua.ApiError); ok {
+			if strings.Contains(apiErr.Error(), fmt.Sprintf("module %s not found", name)) {
+				// Module not found
+				ctxCancelFn()
+				return nil, nil
+			}
+		}
 		ctxCancelFn()
 		return nil, fmt.Errorf("error loading match module: %v", err.Error())
 	}
 
 	// Extract the expected function references.
-	var tab *lua.LTable
-	if t := vm.Get(-1); t.Type() != lua.LTTable {
+	t := vm.Get(-1)
+	if t.Type() != lua.LTTable {
 		ctxCancelFn()
 		return nil, errors.New("match module must return a table containing the match callback functions")
-	} else {
-		tab = t.(*lua.LTable)
 	}
+	tab := t.(*lua.LTable)
 	initFn := tab.RawGet(lua.LString("match_init"))
 	if initFn.Type() != lua.LTFunction {
 		ctxCancelFn()
@@ -140,6 +159,11 @@ func NewRuntimeLuaMatchCore(logger *zap.Logger, db *sql.DB, jsonpbUnmarshaler *j
 		ctxCancelFn()
 		return nil, errors.New("match_terminate not found or not a function")
 	}
+	signalFn := tab.RawGet(lua.LString("match_signal"))
+	if signalFn.Type() != lua.LTFunction {
+		ctxCancelFn()
+		return nil, errors.New("match_signal not found or not a function")
+	}
 
 	core := &RuntimeLuaMatchCore{
 		logger:        logger,
@@ -148,10 +172,14 @@ func NewRuntimeLuaMatchCore(logger *zap.Logger, db *sql.DB, jsonpbUnmarshaler *j
 
 		// deferMessageFn set in MatchInit.
 		// presenceList set in MatchInit.
+		// tickRate set in MatchInit.
 
-		id:    id,
-		node:  node,
-		idStr: fmt.Sprintf("%v.%v", id.String(), node),
+		id:         id,
+		node:       node,
+		stopped:    stopped,
+		idStr:      fmt.Sprintf("%v.%v", id.String(), node),
+		module:     module,
+		createTime: time.Now().UTC().UnixNano() / int64(time.Millisecond),
 		stream: PresenceStream{
 			Mode:    StreamModeMatchAuthoritative,
 			Subject: id,
@@ -166,6 +194,7 @@ func NewRuntimeLuaMatchCore(logger *zap.Logger, db *sql.DB, jsonpbUnmarshaler *j
 		leaveFn:       leaveFn,
 		loopFn:        loopFn,
 		terminateFn:   terminateFn,
+		signalFn:      signalFn,
 		ctx:           ctx,
 		// dispatcher set below.
 
@@ -208,8 +237,8 @@ func (r *RuntimeLuaMatchCore) MatchInit(presenceList *MatchPresenceList, deferMe
 	r.vm.Pop(1)
 
 	labelStr := label.String()
-	if len(labelStr) > 256 {
-		return nil, 0, errors.New("match_init returned invalid label, must be 256 bytes or less")
+	if len(labelStr) > MatchLabelMaxBytes {
+		return nil, 0, fmt.Errorf("match_init returned invalid label, must be %v bytes or less", MatchLabelMaxBytes)
 	}
 
 	// Extract desired tick rate.
@@ -222,9 +251,10 @@ func (r *RuntimeLuaMatchCore) MatchInit(presenceList *MatchPresenceList, deferMe
 	r.vm.Pop(1)
 
 	rateInt := int(rate.(lua.LNumber))
-	if rateInt > 30 || rateInt < 1 {
-		return nil, 0, errors.New("match_init returned invalid tick rate, must be between 1 and 30")
+	if rateInt > 60 || rateInt < 1 {
+		return nil, 0, errors.New("match_init returned invalid tick rate, must be between 1 and 60")
 	}
+	r.tickRate = rateInt
 
 	// Extract initial state.
 	state := r.vm.Get(-1)
@@ -239,7 +269,7 @@ func (r *RuntimeLuaMatchCore) MatchInit(presenceList *MatchPresenceList, deferMe
 	}
 	r.vm.Pop(1)
 
-	if err := r.matchRegistry.UpdateMatchLabel(r.id, labelStr); err != nil {
+	if err := r.matchRegistry.UpdateMatchLabel(r.id, r.tickRate, r.module, labelStr, r.createTime); err != nil {
 		return nil, 0, err
 	}
 	r.label.Store(labelStr)
@@ -254,7 +284,7 @@ func (r *RuntimeLuaMatchCore) MatchInit(presenceList *MatchPresenceList, deferMe
 	return state, rateInt, nil
 }
 
-func (r *RuntimeLuaMatchCore) MatchJoinAttempt(tick int64, state interface{}, userID, sessionID uuid.UUID, username, node string, metadata map[string]string) (interface{}, bool, string, error) {
+func (r *RuntimeLuaMatchCore) MatchJoinAttempt(tick int64, state interface{}, userID, sessionID uuid.UUID, username string, sessionExpiry int64, vars map[string]string, clientIP, clientPort, node string, metadata map[string]string) (interface{}, bool, string, error) {
 	presence := r.vm.CreateTable(0, 4)
 	presence.RawSetString("user_id", lua.LString(userID.String()))
 	presence.RawSetString("session_id", lua.LString(sessionID.String()))
@@ -266,10 +296,33 @@ func (r *RuntimeLuaMatchCore) MatchJoinAttempt(tick int64, state interface{}, us
 		metadataTable.RawSetString(k, lua.LString(v))
 	}
 
+	// Prepare a temporary context that includes the user's session info on top of the base match context.
+	ctx := r.vm.CreateTable(0, 13)
+	r.ctx.ForEach(func(k lua.LValue, v lua.LValue) {
+		ctx.RawSetH(k, v)
+	})
+	ctx.RawSetString(__RUNTIME_LUA_CTX_USER_ID, lua.LString(userID.String()))
+	ctx.RawSetString(__RUNTIME_LUA_CTX_USERNAME, lua.LString(username))
+	if vars != nil {
+		vt := r.vm.CreateTable(0, len(vars))
+		for k, v := range vars {
+			vt.RawSetString(k, lua.LString(v))
+		}
+		ctx.RawSetString(__RUNTIME_LUA_CTX_VARS, vt)
+	}
+	ctx.RawSetString(__RUNTIME_LUA_CTX_USER_SESSION_EXP, lua.LNumber(sessionExpiry))
+	ctx.RawSetString(__RUNTIME_LUA_CTX_SESSION_ID, lua.LString(sessionID.String()))
+	if clientIP != "" {
+		ctx.RawSetString(__RUNTIME_LUA_CTX_CLIENT_IP, lua.LString(clientIP))
+	}
+	if clientPort != "" {
+		ctx.RawSetString(__RUNTIME_LUA_CTX_CLIENT_PORT, lua.LString(clientPort))
+	}
+
 	// Execute the match_join_attempt call.
 	r.vm.Push(LSentinel)
 	r.vm.Push(r.joinAttemptFn)
-	r.vm.Push(r.ctx)
+	r.vm.Push(ctx)
 	r.vm.Push(r.dispatcher)
 	r.vm.Push(lua.LNumber(tick))
 	r.vm.Push(state.(lua.LValue))
@@ -335,11 +388,12 @@ func (r *RuntimeLuaMatchCore) MatchJoin(tick int64, state interface{}, joins []*
 
 	presences := r.vm.CreateTable(len(joins), 0)
 	for i, p := range joins {
-		presence := r.vm.CreateTable(0, 4)
+		presence := r.vm.CreateTable(0, 5)
 		presence.RawSetString("user_id", lua.LString(p.UserID.String()))
 		presence.RawSetString("session_id", lua.LString(p.SessionID.String()))
 		presence.RawSetString("username", lua.LString(p.Username))
 		presence.RawSetString("node", lua.LString(p.Node))
+		presence.RawSetString("reason", lua.LNumber(p.Reason))
 
 		presences.RawSetInt(i+1, presence)
 	}
@@ -376,11 +430,12 @@ func (r *RuntimeLuaMatchCore) MatchJoin(tick int64, state interface{}, joins []*
 func (r *RuntimeLuaMatchCore) MatchLeave(tick int64, state interface{}, leaves []*MatchPresence) (interface{}, error) {
 	presences := r.vm.CreateTable(len(leaves), 0)
 	for i, p := range leaves {
-		presence := r.vm.CreateTable(0, 4)
+		presence := r.vm.CreateTable(0, 5)
 		presence.RawSetString("user_id", lua.LString(p.UserID.String()))
 		presence.RawSetString("session_id", lua.LString(p.SessionID.String()))
 		presence.RawSetString("username", lua.LString(p.Username))
 		presence.RawSetString("node", lua.LString(p.Node))
+		presence.RawSetString("reason", lua.LNumber(p.Reason))
 
 		presences.RawSetInt(i+1, presence)
 	}
@@ -427,7 +482,7 @@ func (r *RuntimeLuaMatchCore) MatchLoop(tick int64, state interface{}, inputCh <
 		presence.RawSetString("username", lua.LString(msg.Username))
 		presence.RawSetString("node", lua.LString(msg.Node))
 
-		in := r.vm.CreateTable(0, 4)
+		in := r.vm.CreateTable(0, 5)
 		in.RawSetString("sender", presence)
 		in.RawSetString("op_code", lua.LNumber(msg.OpCode))
 		if msg.Data != nil {
@@ -435,6 +490,7 @@ func (r *RuntimeLuaMatchCore) MatchLoop(tick int64, state interface{}, inputCh <
 		} else {
 			in.RawSetString("data", lua.LNil)
 		}
+		in.RawSetString("reliable", lua.LBool(msg.Reliable))
 		in.RawSetString("receive_time_ms", lua.LNumber(msg.ReceiveTime))
 
 		input.RawSetInt(i, in)
@@ -499,29 +555,103 @@ func (r *RuntimeLuaMatchCore) MatchTerminate(tick int64, state interface{}, grac
 	return newState, nil
 }
 
+func (r *RuntimeLuaMatchCore) MatchSignal(tick int64, state interface{}, data string) (interface{}, string, error) {
+	// Execute the match_terminate call.
+	r.vm.Push(LSentinel)
+	r.vm.Push(r.signalFn)
+	r.vm.Push(r.ctx)
+	r.vm.Push(r.dispatcher)
+	r.vm.Push(lua.LNumber(tick))
+	r.vm.Push(state.(lua.LValue))
+	r.vm.Push(lua.LString(data))
+
+	err := r.vm.PCall(5, lua.MultRet, nil)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Extract the resulting response data.
+	responseData := r.vm.Get(-1)
+	var responseDataString string
+	if responseData.Type() == lua.LTString {
+		responseDataString = responseData.String()
+	} else if responseData.Type() != lua.LTNil {
+		return nil, "", errors.New("Match signal returned non-string result, stopping match")
+	}
+	r.vm.Pop(1)
+	// Extract the resulting state.
+	newState := r.vm.Get(-1)
+	if newState.Type() == lua.LTNil || newState.Type() == LTSentinel {
+		return nil, "", nil
+	}
+	r.vm.Pop(1)
+	// Check for and remove the sentinel value, will fail if there are any extra return values.
+	if sentinel := r.vm.Get(-1); sentinel.Type() != LTSentinel {
+		return nil, "", errors.New("Match signal returned too many values, stopping match")
+	}
+	r.vm.Pop(1)
+
+	return newState, responseDataString, nil
+}
+
+func (r *RuntimeLuaMatchCore) GetState(state interface{}) (string, error) {
+	stateBytes, err := json.Marshal(RuntimeLuaConvertLuaValue(state.(lua.LValue)))
+	if err != nil {
+		return "", err
+	}
+	return string(stateBytes), nil
+}
+
 func (r *RuntimeLuaMatchCore) Label() string {
 	return r.label.Load()
+}
+
+func (r *RuntimeLuaMatchCore) TickRate() int {
+	return r.tickRate
+}
+
+func (r *RuntimeLuaMatchCore) HandlerName() string {
+	return r.module
+}
+
+func (r *RuntimeLuaMatchCore) CreateTime() int64 {
+	return r.createTime
 }
 
 func (r *RuntimeLuaMatchCore) Cancel() {
 	r.ctxCancelFn()
 }
 
+func (r *RuntimeLuaMatchCore) Cleanup() {
+	r.vm.Close()
+}
+
 func (r *RuntimeLuaMatchCore) broadcastMessage(l *lua.LState) int {
-	presenceIDs, msg := r.validateBroadcast(l)
+	if r.stopped.Load() {
+		l.RaiseError("match stopped")
+		return 0
+	}
+
+	presenceIDs, msg, reliable := r.validateBroadcast(l)
 	if len(presenceIDs) != 0 {
-		r.router.SendToPresenceIDs(r.logger, presenceIDs, true, StreamModeMatchAuthoritative, msg)
+		r.router.SendToPresenceIDs(r.logger, presenceIDs, msg, reliable)
 	}
 
 	return 0
 }
 
 func (r *RuntimeLuaMatchCore) broadcastMessageDeferred(l *lua.LState) int {
-	presenceIDs, msg := r.validateBroadcast(l)
+	if r.stopped.Load() {
+		l.RaiseError("match stopped")
+		return 0
+	}
+
+	presenceIDs, msg, reliable := r.validateBroadcast(l)
 	if len(presenceIDs) != 0 {
 		if err := r.deferMessageFn(&DeferredMessage{
 			PresenceIDs: presenceIDs,
 			Envelope:    msg,
+			Reliable:    reliable,
 		}); err != nil {
 			l.RaiseError("error deferring message broadcast: %v", err)
 		}
@@ -530,14 +660,14 @@ func (r *RuntimeLuaMatchCore) broadcastMessageDeferred(l *lua.LState) int {
 	return 0
 }
 
-func (r *RuntimeLuaMatchCore) validateBroadcast(l *lua.LState) ([]*PresenceID, *rtapi.Envelope) {
+func (r *RuntimeLuaMatchCore) validateBroadcast(l *lua.LState) ([]*PresenceID, *rtapi.Envelope, bool) {
 	opCode := l.CheckInt64(1)
 
 	var dataBytes []byte
 	if data := l.Get(2); data.Type() != lua.LTNil {
 		if data.Type() != lua.LTString {
 			l.ArgError(2, "expects data to be a string or nil")
-			return nil, nil
+			return nil, nil, false
 		}
 		dataBytes = []byte(data.(lua.LString))
 	}
@@ -547,7 +677,7 @@ func (r *RuntimeLuaMatchCore) validateBroadcast(l *lua.LState) ([]*PresenceID, *
 	if filter != nil {
 		fl := filter.Len()
 		if fl == 0 {
-			return nil, nil
+			return nil, nil, false
 		}
 		presenceIDs = make([]*PresenceID, 0, fl)
 		conversionError := false
@@ -590,13 +720,13 @@ func (r *RuntimeLuaMatchCore) validateBroadcast(l *lua.LState) ([]*PresenceID, *
 			presenceIDs = append(presenceIDs, presenceID)
 		})
 		if conversionError {
-			return nil, nil
+			return nil, nil, false
 		}
 	}
 
 	if presenceIDs != nil && len(presenceIDs) == 0 {
 		// Filter is empty, there are no requested message targets.
-		return nil, nil
+		return nil, nil, false
 	}
 
 	sender := l.OptTable(4, nil)
@@ -635,87 +765,76 @@ func (r *RuntimeLuaMatchCore) validateBroadcast(l *lua.LState) ([]*PresenceID, *
 		})
 		if presence.UserId == "" || presence.SessionId == "" || presence.Username == "" {
 			l.ArgError(4, "expects presence to have a valid user_id, session_id, and username")
-			return nil, nil
+			return nil, nil, false
 		}
 		if conversionError {
-			return nil, nil
+			return nil, nil, false
 		}
 	}
 
 	if presenceIDs != nil {
 		// Ensure specific presences actually exist to prevent sending bogus messages to arbitrary users.
-		if len(presenceIDs) == 1 {
+		if len(presenceIDs) == 1 && filter != nil {
 			// Shorter validation cycle if there is only one intended recipient.
 			presenceValue := filter.RawGetInt(1)
 			if presenceValue == lua.LNil {
 				l.ArgError(3, "expects each presence to be non-nil")
-				return nil, nil
+				return nil, nil, false
 			}
 			presenceTable, ok := presenceValue.(*lua.LTable)
 			if !ok {
 				l.ArgError(3, "expects each presence to be a table")
-				return nil, nil
+				return nil, nil, false
 			}
 			userIDValue := presenceTable.RawGetString("user_id")
 			if userIDValue == nil {
 				l.ArgError(3, "expects each presence to have a valid user_id")
-				return nil, nil
+				return nil, nil, false
 			}
 			if userIDValue.Type() != lua.LTString {
 				l.ArgError(3, "expects each presence to have a valid user_id")
-				return nil, nil
+				return nil, nil, false
 			}
 			_, err := uuid.FromString(userIDValue.String())
 			if err != nil {
 				l.ArgError(3, "expects each presence to have a valid user_id")
-				return nil, nil
+				return nil, nil, false
 			}
 			if !r.presenceList.Contains(presenceIDs[0]) {
-				return nil, nil
+				return nil, nil, false
 			}
 		} else {
-			actualPresenceIDs := r.presenceList.ListPresenceIDs()
-			for i := 0; i < len(presenceIDs); i++ {
-				found := false
-				presenceID := presenceIDs[i]
-				for j := 0; j < len(actualPresenceIDs); j++ {
-					if actual := actualPresenceIDs[j]; presenceID.SessionID == actual.SessionID && presenceID.Node == actual.Node {
-						// If it matches, drop it.
-						actualPresenceIDs[j] = actualPresenceIDs[len(actualPresenceIDs)-1]
-						actualPresenceIDs = actualPresenceIDs[:len(actualPresenceIDs)-1]
-						found = true
-						break
-					}
-				}
-				if !found {
-					// If this presence wasn't in the filters, it's not needed.
-					presenceIDs[i] = presenceIDs[len(presenceIDs)-1]
-					presenceIDs = presenceIDs[:len(presenceIDs)-1]
-					i--
-				}
-			}
+			presenceIDs = r.presenceList.FilterPresenceIDs(presenceIDs)
 			if len(presenceIDs) == 0 {
 				// None of the target presenceIDs existed in the list of match members.
-				return nil, nil
+				return nil, nil, false
 			}
 		}
 	}
+
+	reliable := l.OptBool(5, true)
 
 	msg := &rtapi.Envelope{Message: &rtapi.Envelope_MatchData{MatchData: &rtapi.MatchData{
 		MatchId:  r.idStr,
 		Presence: presence,
 		OpCode:   opCode,
 		Data:     dataBytes,
+		Reliable: reliable,
 	}}}
 
 	if presenceIDs == nil {
 		presenceIDs = r.presenceList.ListPresenceIDs()
 	}
 
-	return presenceIDs, msg
+	return presenceIDs, msg, reliable
 }
 
 func (r *RuntimeLuaMatchCore) matchKick(l *lua.LState) int {
+	if r.stopped.Load() {
+		l.RaiseError("match stopped")
+		return 0
+	}
+
 	input := l.OptTable(1, nil)
 	if input == nil {
 		return 0
@@ -782,9 +901,14 @@ func (r *RuntimeLuaMatchCore) matchKick(l *lua.LState) int {
 }
 
 func (r *RuntimeLuaMatchCore) matchLabelUpdate(l *lua.LState) int {
+	if r.stopped.Load() {
+		l.RaiseError("match stopped")
+		return 0
+	}
+
 	input := l.OptString(1, "")
 
-	if err := r.matchRegistry.UpdateMatchLabel(r.id, input); err != nil {
+	if err := r.matchRegistry.UpdateMatchLabel(r.id, r.tickRate, r.module, input, r.createTime); err != nil {
 		l.RaiseError("error updating match label: %v", err.Error())
 		return 0
 	}

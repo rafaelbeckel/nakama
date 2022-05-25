@@ -15,9 +15,10 @@
 package server
 
 import (
-	"github.com/yuin/gopher-lua"
 	"math"
 	"math/bits"
+
+	lua "github.com/heroiclabs/nakama/v3/internal/gopher-lua"
 )
 
 var (

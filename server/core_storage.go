@@ -16,28 +16,23 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"database/sql"
 	"encoding/base64"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"github.com/heroiclabs/nakama-common/runtime"
 	"sort"
 
-	"context"
-
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/timestamp"
-	"github.com/heroiclabs/nakama/api"
-	"github.com/jackc/pgx/pgtype"
+	"github.com/heroiclabs/nakama-common/api"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
-)
-
-var (
-	ErrStorageRejectedVersion    = errors.New("Storage write rejected - version check failed.")
-	ErrStorageRejectedPermission = errors.New("Storage write rejected - permission denied.")
-	ErrStorageWriteFailed        = errors.New("Storage write failed.")
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type storageCursor struct {
@@ -97,17 +92,17 @@ func (s StorageOpDeletes) Less(i, j int) bool {
 }
 
 func StorageListObjects(ctx context.Context, logger *zap.Logger, db *sql.DB, caller uuid.UUID, ownerID *uuid.UUID, collection string, limit int, cursor string) (*api.StorageObjectList, codes.Code, error) {
-	var sc *storageCursor = nil
+	var sc *storageCursor
 	if cursor != "" {
 		sc = &storageCursor{}
-		if cb, err := base64.RawURLEncoding.DecodeString(cursor); err != nil {
+		cb, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
 			logger.Warn("Could not base64 decode storage cursor.", zap.String("cursor", cursor))
 			return nil, codes.InvalidArgument, errors.New("Malformed cursor was used.")
-		} else {
-			if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(sc); err != nil {
-				logger.Warn("Could not decode storage cursor.", zap.String("cursor", cursor))
-				return nil, codes.InvalidArgument, errors.New("Malformed cursor was used.")
-			}
+		}
+		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(sc); err != nil {
+			logger.Warn("Could not decode storage cursor.", zap.String("cursor", cursor))
+			return nil, codes.InvalidArgument, errors.New("Malformed cursor was used.")
 		}
 	}
 
@@ -149,8 +144,15 @@ func StorageListObjectsAll(ctx context.Context, logger *zap.Logger, db *sql.DB, 
 	cursorQuery := ""
 	params := []interface{}{collection, limit + 1}
 	if storageCursor != nil {
-		cursorQuery = ` AND (collection, read, key, user_id) > ($1, 2, $3, $4) `
-		params = append(params, storageCursor.Key, storageCursor.UserID)
+		if authoritative {
+			// Authoritative listings observe the read permission in the cursor.
+			cursorQuery = ` AND (collection, read, key, user_id) > ($1, $3, $4, $5) `
+			params = append(params, storageCursor.Read, storageCursor.Key, storageCursor.UserID)
+		} else {
+			// Non-authoritative listings can only ever list for read permission 2 in this type of listing.
+			cursorQuery = ` AND (collection, read, key, user_id) > ($1, 2, $3, $4) `
+			params = append(params, storageCursor.Key, storageCursor.UserID)
+		}
 	}
 
 	var query string
@@ -159,12 +161,14 @@ func StorageListObjectsAll(ctx context.Context, logger *zap.Logger, db *sql.DB, 
 SELECT collection, key, user_id, value, version, read, write, create_time, update_time
 FROM storage
 WHERE collection = $1` + cursorQuery + `
+ORDER BY read ASC, key ASC, user_id ASC
 LIMIT $2`
 	} else {
 		query = `
 SELECT collection, key, user_id, value, version, read, write, create_time, update_time
 FROM storage
-WHERE collection = $1 AND read = 2` + cursorQuery + `
+WHERE collection = $1 AND read >= 2` + cursorQuery + `
+ORDER BY read ASC, key ASC, user_id ASC
 LIMIT $2`
 	}
 
@@ -175,10 +179,9 @@ LIMIT $2`
 			if err == sql.ErrNoRows {
 				objects = &api.StorageObjectList{Objects: make([]*api.StorageObject, 0)}
 				return nil
-			} else {
-				logger.Error("Could not list storage.", zap.Error(err), zap.String("collection", collection), zap.Int("limit", limit), zap.String("cursor", cursor))
-				return err
 			}
+			logger.Error("Could not list storage.", zap.Error(err), zap.String("collection", collection), zap.Int("limit", limit), zap.String("cursor", cursor))
+			return err
 		}
 		// rows.Close() called in storageListObjects
 
@@ -197,14 +200,16 @@ func StorageListObjectsPublicReadUser(ctx context.Context, logger *zap.Logger, d
 	cursorQuery := ""
 	params := []interface{}{collection, userID, limit + 1}
 	if storageCursor != nil {
-		cursorQuery = ` AND (collection, read, key, user_id) > ($1, 2, $4, $5) `
-		params = append(params, storageCursor.Key, storageCursor.UserID)
+		// Ignore cursor read permission and user ID, the listing operation itself is only scoped to one user and public read permission.
+		cursorQuery = ` AND (collection, read, user_id, key) > ($1, 2, $2, $4) `
+		params = append(params, storageCursor.Key)
 	}
 
 	query := `
 SELECT collection, key, user_id, value, version, read, write, create_time, update_time
 FROM storage
 WHERE collection = $1 AND read = 2 AND user_id = $2 ` + cursorQuery + `
+ORDER BY key ASC
 LIMIT $3`
 
 	var objects *api.StorageObjectList
@@ -214,10 +219,9 @@ LIMIT $3`
 			if err == sql.ErrNoRows {
 				objects = &api.StorageObjectList{Objects: make([]*api.StorageObject, 0)}
 				return nil
-			} else {
-				logger.Error("Could not list storage.", zap.Error(err), zap.String("collection", collection), zap.Int("limit", limit), zap.String("cursor", cursor))
-				return err
 			}
+			logger.Error("Could not list storage.", zap.Error(err), zap.String("collection", collection), zap.Int("limit", limit), zap.String("cursor", cursor))
+			return err
 		}
 		// rows.Close() called in storageListObjects
 
@@ -236,21 +240,24 @@ func StorageListObjectsUser(ctx context.Context, logger *zap.Logger, db *sql.DB,
 	cursorQuery := ""
 	params := []interface{}{collection, userID, limit + 1}
 	if storageCursor != nil {
-		cursorQuery = ` AND (collection, read, key, user_id) > ($1, $4, $5, $6) `
-		params = append(params, storageCursor.Read, storageCursor.Key, storageCursor.UserID)
+		// User ID is always a known user based on the type of the listing operation.
+		cursorQuery = ` AND (collection, user_id, read, key) > ($1, $2, $4, $5) `
+		params = append(params, storageCursor.Read, storageCursor.Key)
 	}
 
 	query := `
 SELECT collection, key, user_id, value, version, read, write, create_time, update_time
 FROM storage
-WHERE collection = $1 AND read > 0 AND user_id = $2 ` + cursorQuery + `
+WHERE collection = $1 AND user_id = $2 AND read >= 1 ` + cursorQuery + `
+ORDER BY read ASC, key ASC
 LIMIT $3`
 	if authoritative {
-		// disregard permissions
+		// List across all read permissions.
 		query = `
 SELECT collection, key, user_id, value, version, read, write, create_time, update_time
 FROM storage
-WHERE collection = $1 AND user_id = $2 ` + cursorQuery + `
+WHERE collection = $1 AND user_id = $2 AND read >= 0 ` + cursorQuery + `
+ORDER BY read ASC, key ASC
 LIMIT $3`
 	}
 
@@ -261,10 +268,9 @@ LIMIT $3`
 			if err == sql.ErrNoRows {
 				objects = &api.StorageObjectList{Objects: make([]*api.StorageObject, 0)}
 				return nil
-			} else {
-				logger.Error("Could not list storage.", zap.Error(err), zap.String("collection", collection), zap.Int("limit", limit), zap.String("cursor", cursor))
-				return err
 			}
+			logger.Error("Could not list storage.", zap.Error(err), zap.String("collection", collection), zap.Int("limit", limit), zap.String("cursor", cursor))
+			return err
 		}
 		// rows.Close() called in storageListObjects
 
@@ -292,16 +298,15 @@ WHERE user_id = $1`
 			if err == sql.ErrNoRows {
 				objects = make([]*api.StorageObject, 0)
 				return nil
-			} else {
-				logger.Error("Could not read storage objects.", zap.Error(err), zap.String("user_id", userID.String()))
-				return err
 			}
+			logger.Error("Could not read storage objects.", zap.Error(err), zap.String("user_id", userID.String()))
+			return err
 		}
 		defer rows.Close()
 
-		funcObjects := make([]*api.StorageObject, 0)
+		funcObjects := make([]*api.StorageObject, 0, 10)
 		for rows.Next() {
-			o := &api.StorageObject{CreateTime: &timestamp.Timestamp{}, UpdateTime: &timestamp.Timestamp{}}
+			o := &api.StorageObject{CreateTime: &timestamppb.Timestamp{}, UpdateTime: &timestamppb.Timestamp{}}
 			var createTime pgtype.Timestamptz
 			var updateTime pgtype.Timestamptz
 
@@ -344,7 +349,7 @@ func storageListObjects(rows *sql.Rows, limit int) (*api.StorageObjectList, erro
 		}
 
 		// There is still room for more objects, read the next one.
-		o := &api.StorageObject{CreateTime: &timestamp.Timestamp{}, UpdateTime: &timestamp.Timestamp{}}
+		o := &api.StorageObject{CreateTime: &timestamppb.Timestamp{}, UpdateTime: &timestamppb.Timestamp{}}
 		var createTime pgtype.Timestamptz
 		var updateTime pgtype.Timestamptz
 
@@ -381,7 +386,7 @@ func storageListObjects(rows *sql.Rows, limit int) (*api.StorageObjectList, erro
 }
 
 func StorageReadObjects(ctx context.Context, logger *zap.Logger, db *sql.DB, caller uuid.UUID, objectIDs []*api.ReadStorageObjectId) (*api.StorageObjects, error) {
-	params := make([]interface{}, 0)
+	params := make([]interface{}, 0, len(objectIDs)*3)
 
 	whereClause := ""
 	for _, id := range objectIDs {
@@ -420,16 +425,15 @@ WHERE
 			if err == sql.ErrNoRows {
 				objects = &api.StorageObjects{Objects: make([]*api.StorageObject, 0)}
 				return nil
-			} else {
-				logger.Error("Could not read storage objects.", zap.Error(err))
-				return err
 			}
+			logger.Error("Could not read storage objects.", zap.Error(err))
+			return err
 		}
 		defer rows.Close()
 
-		funcObjects := &api.StorageObjects{Objects: make([]*api.StorageObject, 0)}
+		funcObjects := &api.StorageObjects{Objects: make([]*api.StorageObject, 0, len(objectIDs))}
 		for rows.Next() {
-			o := &api.StorageObject{CreateTime: &timestamp.Timestamp{}, UpdateTime: &timestamp.Timestamp{}}
+			o := &api.StorageObject{CreateTime: &timestamppb.Timestamp{}, UpdateTime: &timestamppb.Timestamp{}}
 			var createTime pgtype.Timestamptz
 			var updateTime pgtype.Timestamptz
 
@@ -454,9 +458,6 @@ WHERE
 }
 
 func StorageWriteObjects(ctx context.Context, logger *zap.Logger, db *sql.DB, authoritativeWrite bool, ops StorageOpWrites) (*api.StorageObjectAcks, codes.Code, error) {
-	// Ensure writes are processed in a consistent order.
-	sort.Sort(ops)
-
 	var acks []*api.StorageObjectAck
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -467,20 +468,10 @@ func StorageWriteObjects(ctx context.Context, logger *zap.Logger, db *sql.DB, au
 
 	if err = ExecuteInTx(ctx, tx, func() error {
 		// If the transaction is retried ensure we wipe any acks that may have been prepared by previous attempts.
-		acks = make([]*api.StorageObjectAck, 0, ops.Len())
-
-		for _, op := range ops {
-			ack, writeErr := storageWriteObject(ctx, logger, tx, authoritativeWrite, op.OwnerID, op.Object)
-			if writeErr != nil {
-				if writeErr == ErrStorageRejectedVersion || writeErr == ErrStorageRejectedPermission {
-					return StatusError(codes.InvalidArgument, "Storage write rejected.", writeErr)
-				}
-
-				logger.Debug("Error writing storage objects.", zap.Error(err))
-				return writeErr
-			}
-
-			acks = append(acks, ack)
+		var writeErr error
+		acks, writeErr = storageWriteObjects(ctx, logger, tx, authoritativeWrite, ops)
+		if writeErr != nil {
+			return writeErr
 		}
 		return nil
 	}); err != nil {
@@ -494,6 +485,35 @@ func StorageWriteObjects(ctx context.Context, logger *zap.Logger, db *sql.DB, au
 	return &api.StorageObjectAcks{Acks: acks}, codes.OK, nil
 }
 
+func storageWriteObjects(ctx context.Context, logger *zap.Logger, tx *sql.Tx, authoritativeWrite bool, ops StorageOpWrites) ([]*api.StorageObjectAck, error) {
+	// Ensure writes are processed in a consistent order to avoid deadlocks from concurrent operations.
+	// Sorting done on a copy to ensure we don't modify the input, which may be re-used on transaction retries.
+	sortedOps := make(StorageOpWrites, 0, len(ops))
+	indexedOps := make(map[*StorageOpWrite]int, len(ops))
+	for i, op := range ops {
+		sortedOps = append(sortedOps, op)
+		indexedOps[op] = i
+	}
+	sort.Sort(sortedOps)
+
+	// Run operations in the sorted order.
+	acks := make([]*api.StorageObjectAck, ops.Len())
+	for _, op := range sortedOps {
+		ack, writeErr := storageWriteObject(ctx, logger, tx, authoritativeWrite, op.OwnerID, op.Object)
+		if writeErr != nil {
+			if writeErr == runtime.ErrStorageRejectedVersion || writeErr == runtime.ErrStorageRejectedPermission {
+				return nil, StatusError(codes.InvalidArgument, "Storage write rejected.", writeErr)
+			}
+
+			logger.Debug("Error writing storage objects.", zap.Error(writeErr))
+			return nil, writeErr
+		}
+		// Acks are returned in the original order.
+		acks[indexedOps[op]] = ack
+	}
+	return acks, nil
+}
+
 func storageWriteObject(ctx context.Context, logger *zap.Logger, tx *sql.Tx, authoritativeWrite bool, ownerID string, object *api.WriteStorageObject) (*api.StorageObjectAck, error) {
 	var dbVersion sql.NullString
 	var dbPermissionWrite sql.NullInt64
@@ -503,7 +523,7 @@ func storageWriteObject(ctx context.Context, logger *zap.Logger, tx *sql.Tx, aut
 		if err == sql.ErrNoRows {
 			if object.Version != "" && object.Version != "*" {
 				// Conditional write with a specific version but the object did not exist at all.
-				return nil, ErrStorageRejectedVersion
+				return nil, runtime.ErrStorageRejectedVersion
 			}
 		} else {
 			logger.Debug("Error in write storage object pre-flight.", zap.Any("object", object), zap.Error(err))
@@ -514,13 +534,13 @@ func storageWriteObject(ctx context.Context, logger *zap.Logger, tx *sql.Tx, aut
 	if dbVersion.Valid && (object.Version == "*" || (object.Version != "" && object.Version != dbVersion.String)) {
 		// An object existed and it's a conditional write that either:
 		// - Expects no object.
-		// - Or expects a given version bit it does not match.
-		return nil, ErrStorageRejectedVersion
+		// - Or expects a given version but it does not match.
+		return nil, runtime.ErrStorageRejectedVersion
 	}
 
 	if dbPermissionWrite.Valid && dbPermissionWrite.Int64 == 0 && !authoritativeWrite {
 		// Non-authoritative write to an existing storage object with permission 0.
-		return nil, ErrStorageRejectedPermission
+		return nil, runtime.ErrStorageRejectedPermission
 	}
 
 	newVersion := fmt.Sprintf("%x", md5.Sum([]byte(object.Value)))
@@ -546,32 +566,57 @@ func storageWriteObject(ctx context.Context, logger *zap.Logger, tx *sql.Tx, aut
 		return ack, nil
 	}
 
+	params := []interface{}{object.Collection, object.Key, ownerID, object.Value, newVersion, newPermissionRead, newPermissionWrite}
 	var query string
-	if dbVersion.Valid {
-		// Updating an existing storage object.
+	switch {
+	case object.Version != "" && object.Version != "*":
+		// OCC if match.
+		query = "UPDATE storage SET value = $4, version = $5, read = $6, write = $7, update_time = now() WHERE collection = $1 AND key = $2 AND user_id = $3::UUID AND version = $8"
+		params = append(params, object.Version)
+		// Respect permissions in non-authoritative writes.
+		if !authoritativeWrite {
+			query += " AND write = 1"
+		}
+	case dbVersion.Valid && object.Version == "":
+		// An existing storage object was present, but no OCC of any kind is specified.
 		query = "UPDATE storage SET value = $4, version = $5, read = $6, write = $7, update_time = now() WHERE collection = $1 AND key = $2 AND user_id = $3::UUID"
-	} else {
-		// Inserting a new storage object.
+		// Respect permissions in non-authoritative writes.
+		if !authoritativeWrite {
+			query += " AND write = 1"
+		}
+	case dbVersion.Valid && object.Version != "*":
+		// An existing storage object was present, but no OCC if-not-exists required.
+		query = "UPDATE storage SET value = $4, version = $5, read = $6, write = $7, update_time = now() WHERE collection = $1 AND key = $2 AND user_id = $3::UUID AND version = $8"
+		params = append(params, dbVersion.String)
+		// Respect permissions in non-authoritative writes.
+		if !authoritativeWrite {
+			query += " AND write = 1"
+		}
+	default:
+		// OCC if-not-exists, and all other non-OCC cases.
 		query = "INSERT INTO storage (collection, key, user_id, value, version, read, write, create_time, update_time) VALUES ($1, $2, $3::UUID, $4, $5, $6, $7, now(), now())"
+		// Existing permission checks are not applicable for new storage objects.
 	}
 
-	res, err := tx.ExecContext(ctx, query, object.Collection, object.Key, ownerID, object.Value, newVersion, newPermissionRead, newPermissionWrite)
+	res, err := tx.ExecContext(ctx, query, params...)
 	if err != nil {
 		logger.Debug("Could not write storage object, exec error.", zap.Any("object", object), zap.String("query", query), zap.Error(err))
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == dbErrorUniqueViolation {
+			return nil, runtime.ErrStorageRejectedVersion
+		}
 		return nil, err
 	}
 	if rowsAffected, _ := res.RowsAffected(); rowsAffected != 1 {
 		logger.Debug("Could not write storage object, rowsAffected error.", zap.Any("object", object), zap.String("query", query), zap.Error(err))
-		return nil, ErrStorageWriteFailed
+		return nil, runtime.ErrStorageRejectedVersion
 	}
 
 	ack := &api.StorageObjectAck{
 		Collection: object.Collection,
 		Key:        object.Key,
 		Version:    newVersion,
-	}
-	if ownerID != uuid.Nil.String() {
-		ack.UserId = ownerID
+		UserId:     ownerID,
 	}
 
 	return ack, nil

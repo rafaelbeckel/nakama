@@ -58,7 +58,7 @@ function M.verify_payment_apple(request)
 
   local success, code, _, body = pcall(nk.http_request, url_production, "POST", http_headers, http_body)
   if (not success) then
-    nk.logger_warn(("Network error occurred: %q"):format(code))
+    nk.logger_warn(string.format("Network error occurred: %q", code))
     error(code)
   else
     if (code == 200) then
@@ -68,7 +68,7 @@ function M.verify_payment_apple(request)
       elseif (response.status == 21007) then  -- was supposed to be sent to sandbox
         local success, code, _, body = pcall(nk.http_request, url_sandbox, "POST", http_headers, http_body)
         if (not success) then
-          nk.logger_warn(("Network error occurred: %q"):format(code))
+          nk.logger_warn(string.format("Network error occurred: %q", code))
           error(code)
         elseif (code == 200) then
           return nk.json_decode(body)
@@ -84,7 +84,6 @@ function M.google_obtain_access_token(client_email, private_key)
   local scope = "https://www.googleapis.com/auth/androidpublisher"
   local iat = nk.time() / 1000
   local exp = iat + 3600  -- current time + 1hr added in seconds
-
 
   local algo_type = "RS256"
 
@@ -107,7 +106,7 @@ function M.google_obtain_access_token(client_email, private_key)
 
   local success, code, _, body = pcall(nk.http_request, auth_url, "POST", http_headers, form_data)
   if (not success) then
-    nk.logger_warn(("Network error occurred: %q"):format(code))
+    nk.logger_warn(string.format("Network error occurred: %q", code))
     error(code)
   elseif (code == 200) then
     return nk.json_decode(body)["access_token"]
@@ -132,10 +131,10 @@ Request object match the following format:
 }
 
 For Products, this function will return a Lua table that represents the data in this page:
-https://developers.google.com/android-publisher/api-ref/purchases/products#resource
+https://developers.google.com/android-publisher/api-ref/#Purchases.products
 
 For Subscritions, this function will return a Lua table that represents the data in this page:
-https://developers.google.com/android-publisher/api-ref/purchases/subscriptions
+https://developers.google.com/android-publisher/api-ref/#Purchases.subscriptions
 
 This function can also raise an error in case of bad network, bad authentication or invalid receipt data.
 --]]
@@ -143,24 +142,24 @@ This function can also raise an error in case of bad network, bad authentication
 function M.verify_payment_google(request)
   local success, access_token = pcall(M.google_obtain_access_token, request.client_email, request.private_key)
   if (not success) then
-    nk.logger_warn(("Failed to obtain access token: %q"):format(access_token))
+    nk.logger_warn(string.format("Failed to obtain access token: %q", access_token))
     error(access_token)
   end
 
-  local url_template = "https://www.googleapis.com/androidpublisher/v2/applications/%s/purchases/subscriptions/%s/tokens/%s?access_token=%s"
+  local url = "https://www.googleapis.com/androidpublisher/v3/applications/%s/purchases/subscriptions/%s/tokens/%s?access_token=%s"
   if (not request.is_subscription) then
-    url_template = "https://www.googleapis.com/androidpublisher/v2/applications/%s/purchases/products/%s/tokens/%s?access_token=%s"
+    url = "https://www.googleapis.com/androidpublisher/v3/applications/%s/purchases/products/%s/tokens/%s?access_token=%s"
   end
 
-  local url = url_template:format(request.package_name, request.product_id, request.purchase_token, access_token)
-  
+  url = string.format(url, request.package_name, request.product_id, request.purchase_token, access_token)
+
   local http_headers = {
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/json"
   }
   local success, code, _, body = pcall(nk.http_request, url, "GET", http_headers, nil)
   if (not success) then
-    nk.logger_warn(("Network error occurred: %q"):format(code))
+    nk.logger_warn(string.format("Network error occurred: %q", code))
     error(code)
   elseif (code == 200) then
     return nk.json_decode(body)

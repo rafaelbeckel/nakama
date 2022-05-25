@@ -25,10 +25,11 @@ package server
 import (
 	"bytes"
 	"fmt"
-	"github.com/yuin/gopher-lua"
 	"os"
 	"path/filepath"
 	"strings"
+
+	lua "github.com/heroiclabs/nakama/v3/internal/gopher-lua"
 )
 
 const emptyLString lua.LString = lua.LString("")

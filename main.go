@@ -16,46 +16,48 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	cryptoRand "crypto/rand"
+	"encoding/binary"
+	"flag"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
-	"io/ioutil"
-	"path/filepath"
-
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/heroiclabs/nakama/ga"
-	"github.com/heroiclabs/nakama/migrate"
-	"github.com/heroiclabs/nakama/server"
-	"github.com/heroiclabs/nakama/social"
-	_ "github.com/jackc/pgx/stdlib"
+	"github.com/heroiclabs/nakama/v3/ga"
+	"github.com/heroiclabs/nakama/v3/migrate"
+	"github.com/heroiclabs/nakama/v3/server"
+	"github.com/heroiclabs/nakama/v3/social"
+	_ "github.com/jackc/pgx/v4/stdlib"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const cookieFilename = ".cookie"
 
 var (
-	version  string = "2.0.0"
+	version  string = "3.0.0"
 	commitID string = "dev"
 
 	// Shared utility components.
-	jsonpbMarshaler = &jsonpb.Marshaler{
-		EnumsAsInts:  true,
-		EmitDefaults: false,
-		Indent:       "",
-		OrigName:     true,
+	jsonpbMarshaler = &protojson.MarshalOptions{
+		UseEnumNumbers:  true,
+		EmitUnpopulated: false,
+		Indent:          "",
+		UseProtoNames:   true,
 	}
-	jsonpbUnmarshaler = &jsonpb.Unmarshaler{
-		AllowUnknownFields: false,
+	jsonpbUnmarshaler = &protojson.UnmarshalOptions{
+		DiscardUnknown: false,
 	}
 )
 
@@ -63,8 +65,6 @@ func main() {
 	semver := fmt.Sprintf("%s+%s", version, commitID)
 	// Always set default timeout on HTTP client.
 	http.DefaultClient.Timeout = 1500 * time.Millisecond
-	// Initialize the global random obj with customs seed.
-	rand.Seed(time.Now().UnixNano())
 
 	tmpLogger := server.NewJSONLogger(os.Stdout, zapcore.InfoLevel, server.JSONFormat)
 
@@ -75,6 +75,24 @@ func main() {
 			return
 		case "migrate":
 			migrate.Parse(os.Args[2:], tmpLogger)
+			return
+		case "check":
+			// Parse any command line args to look up runtime path.
+			// Use full config structure even if not all of its options are available in this command.
+			config := server.NewConfig(tmpLogger)
+			var runtimePath string
+			flags := flag.NewFlagSet("check", flag.ExitOnError)
+			flags.StringVar(&runtimePath, "runtime.path", filepath.Join(config.GetDataDir(), "modules"), "Path for the server to scan for Lua and Go library files.")
+			if err := flags.Parse(os.Args[2:]); err != nil {
+				tmpLogger.Fatal("Could not parse check flags.")
+			}
+			config.GetRuntime().Path = runtimePath
+
+			if err := server.CheckRuntime(tmpLogger, config); err != nil {
+				// Errors are already logged in the function above.
+				os.Exit(1)
+			}
+			return
 		}
 	}
 
@@ -85,46 +103,71 @@ func main() {
 	startupLogger.Info("Nakama starting")
 	startupLogger.Info("Node", zap.String("name", config.GetName()), zap.String("version", semver), zap.String("runtime", runtime.Version()), zap.Int("cpu", runtime.NumCPU()), zap.Int("proc", runtime.GOMAXPROCS(0)))
 	startupLogger.Info("Data directory", zap.String("path", config.GetDataDir()))
-	startupLogger.Info("Database connections", zap.Strings("dsns", config.GetDatabase().Addresses))
 
-	db, dbVersion := dbConnect(startupLogger, config)
+	// Initialize the global random with strongly seed.
+	var seed int64
+	if err := binary.Read(cryptoRand.Reader, binary.BigEndian, &seed); err != nil {
+		startupLogger.Warn("Failed to get strongly random seed, fallback to a less random one.", zap.Error(err))
+		seed = time.Now().UnixNano()
+	}
+	rand.Seed(seed)
+
+	redactedAddresses := make([]string, 0, 1)
+	for _, address := range config.GetDatabase().Addresses {
+		rawURL := fmt.Sprintf("postgres://%s", address)
+		parsedURL, err := url.Parse(rawURL)
+		if err != nil {
+			logger.Fatal("Bad connection URL", zap.Error(err))
+		}
+		redactedAddresses = append(redactedAddresses, strings.TrimPrefix(parsedURL.Redacted(), "postgres://"))
+	}
+	startupLogger.Info("Database connections", zap.Strings("dsns", redactedAddresses))
+
+	// Global server context.
+	ctx, ctxCancelFn := context.WithCancel(context.Background())
+
+	db, dbVersion := server.DbConnect(ctx, startupLogger, config)
 	startupLogger.Info("Database information", zap.String("version", dbVersion))
 
 	// Check migration status and fail fast if the schema has diverged.
 	migrate.StartupCheck(startupLogger, db)
 
 	// Access to social provider integrations.
-	socialClient := social.NewClient(5 * time.Second)
+	socialClient := social.NewClient(logger, 5*time.Second)
 
 	// Start up server components.
-	matchmaker := server.NewLocalMatchmaker(startupLogger, config.GetName())
-	sessionRegistry := server.NewLocalSessionRegistry()
-	tracker := server.StartLocalTracker(logger, config, sessionRegistry, jsonpbMarshaler)
+	cookie := newOrLoadCookie(config)
+	metrics := server.NewLocalMetrics(logger, startupLogger, db, config)
+	sessionRegistry := server.NewLocalSessionRegistry(metrics)
+	sessionCache := server.NewLocalSessionCache(config)
+	statusRegistry := server.NewStatusRegistry(logger, config, sessionRegistry, jsonpbMarshaler)
+	tracker := server.StartLocalTracker(logger, config, sessionRegistry, statusRegistry, metrics, jsonpbMarshaler)
 	router := server.NewLocalMessageRouter(sessionRegistry, tracker, jsonpbMarshaler)
 	leaderboardCache := server.NewLocalLeaderboardCache(logger, startupLogger, db)
-	leaderboardRankCache := server.NewLocalLeaderboardRankCache(startupLogger, db, config.GetLeaderboard(), leaderboardCache)
-	leaderboardScheduler := server.NewLocalLeaderboardScheduler(logger, db, leaderboardCache, leaderboardRankCache)
-	matchRegistry := server.NewLocalMatchRegistry(logger, startupLogger, config, tracker, router, config.GetName())
+	leaderboardRankCache := server.NewLocalLeaderboardRankCache(ctx, startupLogger, db, config.GetLeaderboard(), leaderboardCache)
+	leaderboardScheduler := server.NewLocalLeaderboardScheduler(logger, db, config, leaderboardCache, leaderboardRankCache)
+	matchRegistry := server.NewLocalMatchRegistry(logger, startupLogger, config, sessionRegistry, tracker, router, metrics, config.GetName())
 	tracker.SetMatchJoinListener(matchRegistry.Join)
 	tracker.SetMatchLeaveListener(matchRegistry.Leave)
 	streamManager := server.NewLocalStreamManager(config, sessionRegistry, tracker)
-	runtime, err := server.NewRuntime(logger, startupLogger, db, jsonpbMarshaler, jsonpbUnmarshaler, config, socialClient, leaderboardCache, leaderboardRankCache, leaderboardScheduler, sessionRegistry, matchRegistry, tracker, streamManager, router)
+	runtime, runtimeInfo, err := server.NewRuntime(ctx, logger, startupLogger, db, jsonpbMarshaler, jsonpbUnmarshaler, config, socialClient, leaderboardCache, leaderboardRankCache, leaderboardScheduler, sessionRegistry, sessionCache, statusRegistry, matchRegistry, tracker, metrics, streamManager, router)
 	if err != nil {
 		startupLogger.Fatal("Failed initializing runtime modules", zap.Error(err))
 	}
+	matchmaker := server.NewLocalMatchmaker(logger, startupLogger, config, router, runtime)
+	partyRegistry := server.NewLocalPartyRegistry(logger, matchmaker, tracker, streamManager, router, config.GetName())
+	tracker.SetPartyJoinListener(partyRegistry.Join)
+	tracker.SetPartyLeaveListener(partyRegistry.Leave)
 
 	leaderboardScheduler.Start(runtime)
 
-	pipeline := server.NewPipeline(logger, config, db, jsonpbMarshaler, jsonpbUnmarshaler, sessionRegistry, matchRegistry, matchmaker, tracker, router, runtime)
-	metricsExporter := server.NewMetricsExporter(logger)
-	metrics := server.NewMetrics(logger, startupLogger, config, metricsExporter)
-	statusHandler := server.NewLocalStatusHandler(logger, sessionRegistry, matchRegistry, tracker, metricsExporter, config.GetName())
+	pipeline := server.NewPipeline(logger, config, db, jsonpbMarshaler, jsonpbUnmarshaler, sessionRegistry, statusRegistry, matchRegistry, partyRegistry, matchmaker, tracker, router, runtime)
+	statusHandler := server.NewLocalStatusHandler(logger, sessionRegistry, matchRegistry, tracker, metrics, config.GetName())
 
-	consoleServer := server.StartConsoleServer(logger, startupLogger, db, config, tracker, statusHandler, configWarnings, semver)
-	apiServer := server.StartApiServer(logger, startupLogger, db, jsonpbMarshaler, jsonpbUnmarshaler, config, socialClient, leaderboardCache, leaderboardRankCache, sessionRegistry, matchRegistry, matchmaker, tracker, router, pipeline, runtime)
+	apiServer := server.StartApiServer(logger, startupLogger, db, jsonpbMarshaler, jsonpbUnmarshaler, config, socialClient, leaderboardCache, leaderboardRankCache, sessionRegistry, sessionCache, statusRegistry, matchRegistry, matchmaker, tracker, router, streamManager, metrics, pipeline, runtime)
+	consoleServer := server.StartConsoleServer(logger, startupLogger, db, config, tracker, router, streamManager, sessionCache, statusRegistry, statusHandler, runtimeInfo, matchRegistry, configWarnings, semver, leaderboardCache, leaderboardRankCache, apiServer, cookie)
 
 	gaenabled := len(os.Getenv("NAKAMA_TELEMETRY")) < 1
-	cookie := newOrLoadCookie(config)
 	const gacode = "UA-89792135-1"
 	var telemetryClient *http.Client
 	if gaenabled {
@@ -161,6 +204,7 @@ func main() {
 	select {
 	case <-matchRegistry.Stop(graceSeconds):
 		// Graceful shutdown has completed.
+		startupLogger.Info("All authoritative matches stopped")
 	case <-timerCh:
 		// Timer has expired, terminate matches immediately.
 		startupLogger.Info("Shutdown grace period expired")
@@ -174,13 +218,19 @@ func main() {
 		timer.Stop()
 	}
 
+	// Signal cancellation to the global runtime context.
+	ctxCancelFn()
+
 	// Gracefully stop remaining server components.
 	apiServer.Stop()
 	consoleServer.Stop()
-	metrics.Stop(logger)
+	matchmaker.Stop()
 	leaderboardScheduler.Stop()
 	tracker.Stop()
+	statusRegistry.Stop()
+	sessionCache.Stop()
 	sessionRegistry.Stop()
+	metrics.Stop(logger)
 
 	if gaenabled {
 		_ = ga.SendSessionStop(telemetryClient, gacode, cookie)
@@ -189,48 +239,6 @@ func main() {
 	startupLogger.Info("Shutdown complete")
 
 	os.Exit(0)
-}
-
-func dbConnect(multiLogger *zap.Logger, config server.Config) (*sql.DB, string) {
-	rawUrl := fmt.Sprintf("postgresql://%s", config.GetDatabase().Addresses[0])
-	parsedUrl, err := url.Parse(rawUrl)
-	if err != nil {
-		multiLogger.Fatal("Bad database connection URL", zap.Error(err))
-	}
-	query := parsedUrl.Query()
-	if len(query.Get("sslmode")) == 0 {
-		query.Set("sslmode", "disable")
-		parsedUrl.RawQuery = query.Encode()
-	}
-
-	if len(parsedUrl.User.Username()) < 1 {
-		parsedUrl.User = url.User("root")
-	}
-	if len(parsedUrl.Path) < 1 {
-		parsedUrl.Path = "/nakama"
-	}
-
-	multiLogger.Debug("Complete database connection URL", zap.String("raw_url", parsedUrl.String()))
-	db, err := sql.Open("pgx", parsedUrl.String())
-	if err != nil {
-		multiLogger.Fatal("Error connecting to database", zap.Error(err))
-	}
-	// Limit the time allowed to ping database and get version to 15 seconds total.
-	ctx, _ := context.WithTimeout(context.Background(), 15*time.Second)
-	if err = db.PingContext(ctx); err != nil {
-		multiLogger.Fatal("Error pinging database", zap.Error(err))
-	}
-
-	db.SetConnMaxLifetime(time.Millisecond * time.Duration(config.GetDatabase().ConnMaxLifetimeMs))
-	db.SetMaxOpenConns(config.GetDatabase().MaxOpenConns)
-	db.SetMaxIdleConns(config.GetDatabase().MaxIdleConns)
-
-	var dbVersion string
-	if err = db.QueryRowContext(ctx, "SELECT version()").Scan(&dbVersion); err != nil {
-		multiLogger.Fatal("Error querying database version", zap.Error(err))
-	}
-
-	return db, dbVersion
 }
 
 // Help improve Nakama by sending anonymous usage statistics.

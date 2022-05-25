@@ -15,10 +15,11 @@
 package server
 
 import (
+	"context"
+
 	"github.com/gofrs/uuid"
-	"github.com/heroiclabs/nakama/api"
+	"github.com/heroiclabs/nakama-common/api"
 	"go.uber.org/zap"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -27,7 +28,7 @@ func (s *ApiServer) GetUsers(ctx context.Context, in *api.GetUsersRequest) (*api
 	// Before hook.
 	if fn := s.runtime.BeforeGetUsers(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -41,21 +42,19 @@ func (s *ApiServer) GetUsers(ctx context.Context, in *api.GetUsersRequest) (*api
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	if in.GetIds() == nil && in.GetUsernames() == nil && in.GetFacebookIds() == nil {
+	if len(in.GetIds()) == 0 && len(in.GetUsernames()) == 0 && len(in.GetFacebookIds()) == 0 {
 		return &api.Users{}, nil
 	}
 
-	ids := make([]string, 0)
-	usernames := make([]string, 0)
-	facebookIDs := make([]string, 0)
-
-	if in.GetIds() != nil {
+	var ids []string
+	if len(in.GetIds()) != 0 {
+		ids = make([]string, 0, len(in.GetIds()))
 		for _, id := range in.GetIds() {
 			if _, uuidErr := uuid.FromString(id); uuidErr != nil {
 				return nil, status.Error(codes.InvalidArgument, "ID '"+id+"' is not a valid system ID.")
@@ -65,27 +64,19 @@ func (s *ApiServer) GetUsers(ctx context.Context, in *api.GetUsersRequest) (*api
 		}
 	}
 
-	if in.GetUsernames() != nil {
-		usernames = in.GetUsernames()
-	}
-
-	if in.GetFacebookIds() != nil {
-		facebookIDs = in.GetFacebookIds()
-	}
-
-	users, err := GetUsers(ctx, s.logger, s.db, s.tracker, ids, usernames, facebookIDs)
+	users, err := GetUsers(ctx, s.logger, s.db, s.statusRegistry, ids, in.GetUsernames(), in.GetFacebookIds())
 	if err != nil {
 		return nil, status.Error(codes.Internal, "Error retrieving user accounts.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterGetUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, users, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, users, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return users, nil

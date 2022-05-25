@@ -21,16 +21,16 @@ import (
 	"strings"
 
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/timestamp"
-	"github.com/heroiclabs/nakama/api"
-	"github.com/jackc/pgx/pgtype"
+	"github.com/heroiclabs/nakama-common/api"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func GetUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, ids, usernames, fbIDs []string) (*api.Users, error) {
+func GetUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry *StatusRegistry, ids, usernames, fbIDs []string) (*api.Users, error) {
 	query := `
 SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata,
-	facebook_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
+	apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
 FROM users
 WHERE`
 
@@ -39,7 +39,7 @@ WHERE`
 	facebookStatements := make([]string, 0, len(fbIDs))
 	params := make([]interface{}, 0)
 	counter := 1
-	useSqlOr := false
+	useSQLOr := false
 
 	if len(ids) > 0 {
 		for _, id := range ids {
@@ -49,7 +49,7 @@ WHERE`
 			counter++
 		}
 		query = query + " id IN (" + strings.Join(idStatements, ", ") + ")"
-		useSqlOr = true
+		useSQLOr = true
 	}
 
 	if len(usernames) > 0 {
@@ -59,11 +59,11 @@ WHERE`
 			usernameStatements = append(usernameStatements, statement)
 			counter++
 		}
-		if useSqlOr {
+		if useSQLOr {
 			query = query + " OR"
 		}
 		query = query + " username IN (" + strings.Join(usernameStatements, ", ") + ")"
-		useSqlOr = true
+		useSQLOr = true
 	}
 
 	if len(fbIDs) > 0 {
@@ -73,7 +73,7 @@ WHERE`
 			facebookStatements = append(facebookStatements, statement)
 			counter++
 		}
-		if useSqlOr {
+		if useSQLOr {
 			query = query + " OR"
 		}
 		query = query + " facebook_id IN (" + strings.Join(facebookStatements, ", ") + ")"
@@ -84,21 +84,94 @@ WHERE`
 		logger.Error("Error retrieving user accounts.", zap.Error(err), zap.Strings("user_ids", ids), zap.Strings("usernames", usernames), zap.Strings("facebook_ids", fbIDs))
 		return nil, err
 	}
-	defer rows.Close()
 
 	users := &api.Users{Users: make([]*api.User, 0)}
 	for rows.Next() {
-		user, err := convertUser(tracker, rows)
+		user, err := convertUser(rows)
 		if err != nil {
+			_ = rows.Close()
 			logger.Error("Error retrieving user accounts.", zap.Error(err), zap.Strings("user_ids", ids), zap.Strings("usernames", usernames), zap.Strings("facebook_ids", fbIDs))
 			return nil, err
 		}
 		users.Users = append(users.Users, user)
 	}
+	_ = rows.Close()
 	if err = rows.Err(); err != nil {
 		logger.Error("Error retrieving user accounts.", zap.Error(err), zap.Strings("user_ids", ids), zap.Strings("usernames", usernames), zap.Strings("facebook_ids", fbIDs))
 		return nil, err
 	}
+
+	statusRegistry.FillOnlineUsers(users.Users)
+
+	return users, nil
+}
+
+func GetRandomUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry *StatusRegistry, count int) ([]*api.User, error) {
+	if count == 0 {
+		return []*api.User{}, nil
+	}
+
+	query := `
+SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata,
+	apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
+FROM users
+WHERE id > $1
+LIMIT $2`
+	rows, err := db.QueryContext(ctx, query, uuid.Must(uuid.NewV4()).String(), count)
+	if err != nil {
+		logger.Error("Error retrieving random user accounts.", zap.Error(err))
+		return nil, err
+	}
+	users := make([]*api.User, 0, count)
+	for rows.Next() {
+		user, err := convertUser(rows)
+		if err != nil {
+			_ = rows.Close()
+			logger.Error("Error retrieving random user accounts.", zap.Error(err))
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	_ = rows.Close()
+
+	if len(users) < count {
+		// Need more users.
+		query := `
+SELECT id, username, display_name, avatar_url, lang_tag, location, timezone, metadata,
+	apple_id, facebook_id, facebook_instant_game_id, google_id, gamecenter_id, steam_id, edge_count, create_time, update_time
+FROM users
+WHERE id > $1
+LIMIT $2`
+		rows, err := db.QueryContext(ctx, query, uuid.Nil.String(), count)
+		if err != nil {
+			logger.Error("Error retrieving random user accounts.", zap.Error(err))
+			return nil, err
+		}
+		for rows.Next() {
+			user, err := convertUser(rows)
+			if err != nil {
+				_ = rows.Close()
+				logger.Error("Error retrieving random user accounts.", zap.Error(err))
+				return nil, err
+			}
+			var found bool
+			for _, existing := range users {
+				if existing.Id == user.Id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				users = append(users, user)
+			}
+			if len(users) >= count {
+				break
+			}
+		}
+		_ = rows.Close()
+	}
+
+	statusRegistry.FillOnlineUsers(users)
 
 	return users, nil
 }
@@ -112,37 +185,43 @@ func DeleteUser(ctx context.Context, tx *sql.Tx, userID uuid.UUID) (int64, error
 	return res.RowsAffected()
 }
 
-func BanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, ids []string) error {
+func BanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, sessionCache SessionCache, ids []uuid.UUID) error {
 	statements := make([]string, 0, len(ids))
 	params := make([]interface{}, 0, len(ids))
 	for i, id := range ids {
 		statements = append(statements, "$"+strconv.Itoa(i+1))
-		params = append(params, id)
+		params = append(params, id.String())
 	}
 
 	query := "UPDATE users SET disable_time = now() WHERE id IN (" + strings.Join(statements, ", ") + ")"
 	_, err := db.ExecContext(ctx, query, params...)
 	if err != nil {
-		logger.Error("Error banning user accounts.", zap.Error(err), zap.Strings("ids", ids))
+		logger.Error("Error banning user accounts.", zap.Error(err), zap.Any("ids", params))
 		return err
 	}
+
+	sessionCache.Ban(ids)
+
 	return nil
 }
 
-func UnbanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, ids []string) error {
+func UnbanUsers(ctx context.Context, logger *zap.Logger, db *sql.DB, sessionCache SessionCache, ids []uuid.UUID) error {
 	statements := make([]string, 0, len(ids))
 	params := make([]interface{}, 0, len(ids))
 	for i, id := range ids {
 		statements = append(statements, "$"+strconv.Itoa(i+1))
-		params = append(params, id)
+		params = append(params, id.String())
 	}
 
 	query := "UPDATE users SET disable_time = '1970-01-01 00:00:00 UTC' WHERE id IN (" + strings.Join(statements, ", ") + ")"
 	_, err := db.ExecContext(ctx, query, params...)
 	if err != nil {
-		logger.Error("Error unbanning user accounts.", zap.Error(err), zap.Strings("ids", ids))
+		logger.Error("Error unbanning user accounts.", zap.Error(err), zap.Any("ids", params))
 		return err
 	}
+
+	sessionCache.Unban(ids)
+
 	return nil
 }
 
@@ -159,7 +238,7 @@ WHERE id = $1::UUID AND NOT EXISTS (
 	return count != 0, err
 }
 
-func convertUser(tracker Tracker, rows *sql.Rows) (*api.User, error) {
+func convertUser(rows *sql.Rows) (*api.User, error) {
 	var id string
 	var displayName sql.NullString
 	var username sql.NullString
@@ -168,7 +247,9 @@ func convertUser(tracker Tracker, rows *sql.Rows) (*api.User, error) {
 	var location sql.NullString
 	var timezone sql.NullString
 	var metadata []byte
+	var apple sql.NullString
 	var facebook sql.NullString
+	var facebookInstantGame sql.NullString
 	var google sql.NullString
 	var gamecenter sql.NullString
 	var steam sql.NullString
@@ -177,34 +258,36 @@ func convertUser(tracker Tracker, rows *sql.Rows) (*api.User, error) {
 	var updateTime pgtype.Timestamptz
 
 	err := rows.Scan(&id, &username, &displayName, &avatarURL, &langTag, &location, &timezone, &metadata,
-		&facebook, &google, &gamecenter, &steam, &edgeCount, &createTime, &updateTime)
+		&apple, &facebook, &facebookInstantGame, &google, &gamecenter, &steam, &edgeCount, &createTime, &updateTime)
 	if err != nil {
 		return nil, err
 	}
 
 	userID := uuid.FromStringOrNil(id)
 	return &api.User{
-		Id:           userID.String(),
-		Username:     username.String,
-		DisplayName:  displayName.String,
-		AvatarUrl:    avatarURL.String,
-		LangTag:      langTag.String,
-		Location:     location.String,
-		Timezone:     timezone.String,
-		Metadata:     string(metadata),
-		FacebookId:   facebook.String,
-		GoogleId:     google.String,
-		GamecenterId: gamecenter.String,
-		SteamId:      steam.String,
-		EdgeCount:    int32(edgeCount),
-		CreateTime:   &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
-		UpdateTime:   &timestamp.Timestamp{Seconds: updateTime.Time.Unix()},
-		Online:       tracker.StreamExists(PresenceStream{Mode: StreamModeNotifications, Subject: userID}),
+		Id:                    userID.String(),
+		Username:              username.String,
+		DisplayName:           displayName.String,
+		AvatarUrl:             avatarURL.String,
+		LangTag:               langTag.String,
+		Location:              location.String,
+		Timezone:              timezone.String,
+		Metadata:              string(metadata),
+		AppleId:               apple.String,
+		FacebookId:            facebook.String,
+		FacebookInstantGameId: facebookInstantGame.String,
+		GoogleId:              google.String,
+		GamecenterId:          gamecenter.String,
+		SteamId:               steam.String,
+		EdgeCount:             int32(edgeCount),
+		CreateTime:            &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
+		UpdateTime:            &timestamppb.Timestamp{Seconds: updateTime.Time.Unix()},
+		// Online filled later.
 	}, nil
 }
 
 func fetchUserID(ctx context.Context, db *sql.DB, usernames []string) ([]string, error) {
-	ids := make([]string, 0)
+	ids := make([]string, 0, len(usernames))
 	if len(usernames) == 0 {
 		return ids, nil
 	}

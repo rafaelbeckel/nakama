@@ -15,13 +15,15 @@
 package server
 
 import (
+	"context"
+	"github.com/heroiclabs/nakama-common/runtime"
+
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/empty"
-	"github.com/heroiclabs/nakama/api"
+	"github.com/heroiclabs/nakama-common/api"
 	"go.uber.org/zap"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func (s *ApiServer) CreateGroup(ctx context.Context, in *api.CreateGroupRequest) (*api.Group, error) {
@@ -30,7 +32,7 @@ func (s *ApiServer) CreateGroup(ctx context.Context, in *api.CreateGroupRequest)
 	// Before hook.
 	if fn := s.runtime.BeforeCreateGroup(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -44,7 +46,7 @@ func (s *ApiServer) CreateGroup(ctx context.Context, in *api.CreateGroupRequest)
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -54,34 +56,42 @@ func (s *ApiServer) CreateGroup(ctx context.Context, in *api.CreateGroupRequest)
 		return nil, status.Error(codes.InvalidArgument, "Group name must be set.")
 	}
 
-	group, err := CreateGroup(ctx, s.logger, s.db, userID, userID, in.GetName(), in.GetLangTag(), in.GetDescription(), in.GetAvatarUrl(), "", in.GetOpen(), -1)
+	maxCount := 100
+	if mc := in.MaxCount; mc != 0 {
+		if mc < 1 {
+			return nil, status.Error(codes.InvalidArgument, "Group max count must be >= 1 when set.")
+		}
+		maxCount = int(mc)
+	}
+
+	group, err := CreateGroup(ctx, s.logger, s.db, userID, userID, in.GetName(), in.GetLangTag(), in.GetDescription(), in.GetAvatarUrl(), "", in.GetOpen(), maxCount)
 	if err != nil {
-		if err == ErrGroupNameInUse {
-			return nil, status.Error(codes.InvalidArgument, "Group name is in use.")
+		if err == runtime.ErrGroupNameInUse {
+			return nil, status.Error(codes.AlreadyExists, "Group name is in use.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to create group.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterCreateGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, group, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, group, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return group, nil
 }
 
-func (s *ApiServer) UpdateGroup(ctx context.Context, in *api.UpdateGroupRequest) (*empty.Empty, error) {
+func (s *ApiServer) UpdateGroup(ctx context.Context, in *api.UpdateGroupRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 
 	// Before hook.
 	if fn := s.runtime.BeforeUpdateGroup(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -95,7 +105,7 @@ func (s *ApiServer) UpdateGroup(ctx context.Context, in *api.UpdateGroupRequest)
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -122,38 +132,41 @@ func (s *ApiServer) UpdateGroup(ctx context.Context, in *api.UpdateGroupRequest)
 		}
 	}
 
-	err = UpdateGroup(ctx, s.logger, s.db, groupID, userID, uuid.Nil, in.GetName(), in.GetLangTag(), in.GetDescription(), in.GetAvatarUrl(), nil, in.GetOpen(), -1)
-	if err != nil {
-		if err == ErrGroupPermissionDenied {
+	if err = UpdateGroup(ctx, s.logger, s.db, groupID, userID, uuid.Nil, in.GetName(), in.GetLangTag(), in.GetDescription(), in.GetAvatarUrl(), nil, in.GetOpen(), -1); err != nil {
+		switch err {
+		case runtime.ErrGroupPermissionDenied:
 			return nil, status.Error(codes.NotFound, "Group not found or you're not allowed to update.")
-		} else if err == ErrGroupNoUpdateOps {
+		case runtime.ErrGroupNoUpdateOps:
 			return nil, status.Error(codes.InvalidArgument, "Specify at least one field to update.")
-		} else if err == ErrGroupNotUpdated {
+		case runtime.ErrGroupNotUpdated:
 			return nil, status.Error(codes.InvalidArgument, "No new fields in group update.")
+		case runtime.ErrGroupNameInUse:
+			return nil, status.Error(codes.InvalidArgument, "Group name is in use.")
+		default:
+			return nil, status.Error(codes.Internal, "Error while trying to update group.")
 		}
-		return nil, status.Error(codes.Internal, "Error while trying to update group.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterUpdateGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest) (*empty.Empty, error) {
+func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 
 	// Before hook.
 	if fn := s.runtime.BeforeDeleteGroup(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -167,7 +180,7 @@ func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest)
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -184,7 +197,7 @@ func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest)
 
 	err = DeleteGroup(ctx, s.logger, s.db, groupID, userID)
 	if err != nil {
-		if err == ErrGroupPermissionDenied {
+		if err == runtime.ErrGroupPermissionDenied {
 			return nil, status.Error(codes.InvalidArgument, "Group not found or you're not allowed to delete.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to delete group.")
@@ -192,25 +205,25 @@ func (s *ApiServer) DeleteGroup(ctx context.Context, in *api.DeleteGroupRequest)
 
 	// After hook.
 	if fn := s.runtime.AfterDeleteGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*empty.Empty, error) {
+func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 	username := ctx.Value(ctxUsernameKey{}).(string)
 
 	// Before hook.
 	if fn := s.runtime.BeforeJoinGroup(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -224,7 +237,7 @@ func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*e
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -241,9 +254,9 @@ func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*e
 
 	err = JoinGroup(ctx, s.logger, s.db, s.router, groupID, userID, username)
 	if err != nil {
-		if err == ErrGroupNotFound {
+		if err == runtime.ErrGroupNotFound {
 			return nil, status.Error(codes.NotFound, "Group not found.")
-		} else if err == ErrGroupFull {
+		} else if err == runtime.ErrGroupFull {
 			return nil, status.Error(codes.InvalidArgument, "Group is full.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to join group.")
@@ -251,24 +264,25 @@ func (s *ApiServer) JoinGroup(ctx context.Context, in *api.JoinGroupRequest) (*e
 
 	// After hook.
 	if fn := s.runtime.AfterJoinGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *ApiServer) LeaveGroup(ctx context.Context, in *api.LeaveGroupRequest) (*empty.Empty, error) {
+func (s *ApiServer) LeaveGroup(ctx context.Context, in *api.LeaveGroupRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+	username := ctx.Value(ctxUsernameKey{}).(string)
 
 	// Before hook.
 	if fn := s.runtime.BeforeLeaveGroup(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -282,7 +296,7 @@ func (s *ApiServer) LeaveGroup(ctx context.Context, in *api.LeaveGroupRequest) (
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -297,9 +311,9 @@ func (s *ApiServer) LeaveGroup(ctx context.Context, in *api.LeaveGroupRequest) (
 		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
 	}
 
-	err = LeaveGroup(ctx, s.logger, s.db, groupID, userID)
+	err = LeaveGroup(ctx, s.logger, s.db, s.tracker, s.router, s.streamManager, groupID, userID, username)
 	if err != nil {
-		if err == ErrGroupLastSuperadmin {
+		if err == runtime.ErrGroupLastSuperadmin {
 			return nil, status.Error(codes.InvalidArgument, "Cannot leave group when you are the last superadmin.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to leave group.")
@@ -307,24 +321,24 @@ func (s *ApiServer) LeaveGroup(ctx context.Context, in *api.LeaveGroupRequest) (
 
 	// After hook.
 	if fn := s.runtime.AfterLeaveGroup(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), username, ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequest) (*empty.Empty, error) {
+func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 
 	// Before hook.
 	if fn := s.runtime.BeforeAddGroupUsers(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -338,7 +352,7 @@ func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequ
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +368,7 @@ func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequ
 	}
 
 	if len(in.GetUserIds()) == 0 {
-		return &empty.Empty{}, nil
+		return &emptypb.Empty{}, nil
 	}
 
 	userIDs := make([]uuid.UUID, 0, len(in.GetUserIds()))
@@ -368,34 +382,36 @@ func (s *ApiServer) AddGroupUsers(ctx context.Context, in *api.AddGroupUsersRequ
 
 	err = AddGroupUsers(ctx, s.logger, s.db, s.router, userID, groupID, userIDs)
 	if err != nil {
-		if err == ErrGroupPermissionDenied {
+		if err == runtime.ErrGroupPermissionDenied {
 			return nil, status.Error(codes.NotFound, "Group not found or permission denied.")
-		} else if err == ErrGroupFull {
+		} else if err == runtime.ErrGroupFull {
 			return nil, status.Error(codes.InvalidArgument, "Group is full.")
+		} else if err == runtime.ErrGroupUserNotFound {
+			return nil, status.Error(codes.InvalidArgument, "One or more users not found.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to add users to a group.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterAddGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRequest) (*empty.Empty, error) {
+func (s *ApiServer) BanGroupUsers(ctx context.Context, in *api.BanGroupUsersRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 
 	// Before hook.
-	if fn := s.runtime.BeforeKickGroupUsers(); fn != nil {
+	if fn := s.runtime.BeforeBanGroupUsers(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -409,7 +425,7 @@ func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRe
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -425,7 +441,7 @@ func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRe
 	}
 
 	if len(in.GetUserIds()) == 0 {
-		return &empty.Empty{}, nil
+		return &emptypb.Empty{}, nil
 	}
 
 	userIDs := make([]uuid.UUID, 0, len(in.GetUserIds()))
@@ -437,8 +453,76 @@ func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRe
 		userIDs = append(userIDs, uid)
 	}
 
-	if err = KickGroupUsers(ctx, s.logger, s.db, userID, groupID, userIDs); err != nil {
-		if err == ErrGroupPermissionDenied {
+	if err = BanGroupUsers(ctx, s.logger, s.db, s.tracker, s.router, s.streamManager, userID, groupID, userIDs); err != nil {
+		if err == runtime.ErrGroupPermissionDenied {
+			return nil, status.Error(codes.NotFound, "Group not found or permission denied.")
+		}
+		return nil, status.Error(codes.Internal, "Error while trying to ban users from a group.")
+	}
+
+	// After hook.
+	if fn := s.runtime.AfterBanGroupUsers(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRequest) (*emptypb.Empty, error) {
+	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+
+	// Before hook.
+	if fn := s.runtime.BeforeKickGroupUsers(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if in.GetGroupId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "Group ID must be set.")
+	}
+
+	groupID, err := uuid.FromString(in.GetGroupId())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
+	}
+
+	if len(in.GetUserIds()) == 0 {
+		return &emptypb.Empty{}, nil
+	}
+
+	userIDs := make([]uuid.UUID, 0, len(in.GetUserIds()))
+	for _, id := range in.GetUserIds() {
+		uid := uuid.FromStringOrNil(id)
+		if uid == uuid.Nil {
+			return nil, status.Error(codes.InvalidArgument, "User ID must be a valid ID.")
+		}
+		userIDs = append(userIDs, uid)
+	}
+
+	if err = KickGroupUsers(ctx, s.logger, s.db, s.tracker, s.router, s.streamManager, userID, groupID, userIDs); err != nil {
+		if err == runtime.ErrGroupPermissionDenied {
 			return nil, status.Error(codes.NotFound, "Group not found or permission denied.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to kick users from a group.")
@@ -446,24 +530,24 @@ func (s *ApiServer) KickGroupUsers(ctx context.Context, in *api.KickGroupUsersRe
 
 	// After hook.
 	if fn := s.runtime.AfterKickGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupUsersRequest) (*empty.Empty, error) {
+func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupUsersRequest) (*emptypb.Empty, error) {
 	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
 
 	// Before hook.
 	if fn := s.runtime.BeforePromoteGroupUsers(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -477,7 +561,7 @@ func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupU
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -493,7 +577,7 @@ func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupU
 	}
 
 	if len(in.GetUserIds()) == 0 {
-		return &empty.Empty{}, nil
+		return &emptypb.Empty{}, nil
 	}
 
 	userIDs := make([]uuid.UUID, 0, len(in.GetUserIds()))
@@ -505,11 +589,11 @@ func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupU
 		userIDs = append(userIDs, uid)
 	}
 
-	err = PromoteGroupUsers(ctx, s.logger, s.db, userID, groupID, userIDs)
+	err = PromoteGroupUsers(ctx, s.logger, s.db, s.router, userID, groupID, userIDs)
 	if err != nil {
-		if err == ErrGroupPermissionDenied {
+		if err == runtime.ErrGroupPermissionDenied {
 			return nil, status.Error(codes.NotFound, "Group not found or permission denied.")
-		} else if err == ErrGroupFull {
+		} else if err == runtime.ErrGroupFull {
 			return nil, status.Error(codes.InvalidArgument, "Group is full.")
 		}
 		return nil, status.Error(codes.Internal, "Error while trying to promote users in a group.")
@@ -517,22 +601,22 @@ func (s *ApiServer) PromoteGroupUsers(ctx context.Context, in *api.PromoteGroupU
 
 	// After hook.
 	if fn := s.runtime.AfterPromoteGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func (s *ApiServer) ListGroupUsers(ctx context.Context, in *api.ListGroupUsersRequest) (*api.GroupUserList, error) {
 	// Before hook.
 	if fn := s.runtime.BeforeListGroupUsers(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -546,7 +630,7 @@ func (s *ApiServer) ListGroupUsers(ctx context.Context, in *api.ListGroupUsersRe
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -561,29 +645,118 @@ func (s *ApiServer) ListGroupUsers(ctx context.Context, in *api.ListGroupUsersRe
 		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
 	}
 
-	groupUsers, err := ListGroupUsers(ctx, s.logger, s.db, s.tracker, groupID)
+	limit := 100
+	if in.GetLimit() != nil {
+		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
+		}
+		limit = int(in.GetLimit().Value)
+	}
+
+	state := in.GetState()
+	if state != nil {
+		if state := in.GetState().Value; state < 0 || state > 4 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid state - state must be between 0 and 4.")
+		}
+	}
+
+	groupUsers, err := ListGroupUsers(ctx, s.logger, s.db, s.statusRegistry, groupID, limit, state, in.GetCursor())
 	if err != nil {
+		if err == runtime.ErrGroupUserInvalidCursor {
+			return nil, status.Error(codes.InvalidArgument, "Cursor is invalid.")
+		}
 		return nil, status.Error(codes.Internal, "Error while trying to list users in a group.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterListGroupUsers(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groupUsers, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groupUsers, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return groupUsers, nil
+}
+
+func (s *ApiServer) DemoteGroupUsers(ctx context.Context, in *api.DemoteGroupUsersRequest) (*emptypb.Empty, error) {
+	userID := ctx.Value(ctxUserIDKey{}).(uuid.UUID)
+
+	// Before hook.
+	if fn := s.runtime.BeforeDemoteGroupUsers(); fn != nil {
+		beforeFn := func(clientIP, clientPort string) error {
+			result, err, code := fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			if err != nil {
+				return status.Error(code, err.Error())
+			}
+			if result == nil {
+				// If result is nil, requested resource is disabled.
+				s.logger.Warn("Intercepted a disabled resource.", zap.Any("resource", ctx.Value(ctxFullMethodKey{}).(string)), zap.String("uid", userID.String()))
+				return status.Error(codes.NotFound, "Requested resource was not found.")
+			}
+			in = result
+			return nil
+		}
+
+		// Execute the before function lambda wrapped in a trace for stats measurement.
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if in.GetGroupId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "Group ID must be set.")
+	}
+
+	groupID, err := uuid.FromString(in.GetGroupId())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
+	}
+
+	if len(in.GetUserIds()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "User IDs must be set.")
+	}
+
+	userIDs := make([]uuid.UUID, 0, len(in.GetUserIds()))
+	for _, id := range in.GetUserIds() {
+		uid := uuid.FromStringOrNil(id)
+		if uid == uuid.Nil {
+			return nil, status.Error(codes.InvalidArgument, "User ID must be a valid ID.")
+		}
+		userIDs = append(userIDs, uid)
+	}
+
+	err = DemoteGroupUsers(ctx, s.logger, s.db, s.router, userID, groupID, userIDs)
+	if err != nil {
+		if err == runtime.ErrGroupPermissionDenied {
+			return nil, status.Error(codes.NotFound, "Group not found or permission denied.")
+		} else if err == runtime.ErrGroupFull {
+			return nil, status.Error(codes.InvalidArgument, "Group is full.")
+		}
+		return nil, status.Error(codes.Internal, "Error while trying to demote users in a group.")
+	}
+
+	// After hook.
+	if fn := s.runtime.AfterDemoteGroupUsers(); fn != nil {
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, userID.String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+		}
+
+		// Execute the after function lambda wrapped in a trace for stats measurement.
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+	}
+
+	return &emptypb.Empty{}, nil
 }
 
 func (s *ApiServer) ListUserGroups(ctx context.Context, in *api.ListUserGroupsRequest) (*api.UserGroupList, error) {
 	// Before hook.
 	if fn := s.runtime.BeforeListUserGroups(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -597,7 +770,7 @@ func (s *ApiServer) ListUserGroups(ctx context.Context, in *api.ListUserGroupsRe
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -612,19 +785,37 @@ func (s *ApiServer) ListUserGroups(ctx context.Context, in *api.ListUserGroupsRe
 		return nil, status.Error(codes.InvalidArgument, "Group ID must be a valid ID.")
 	}
 
-	userGroups, err := ListUserGroups(ctx, s.logger, s.db, userID)
+	limit := 100
+	if in.GetLimit() != nil {
+		if in.GetLimit().Value < 1 || in.GetLimit().Value > 100 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid limit - limit must be between 1 and 100.")
+		}
+		limit = int(in.GetLimit().Value)
+	}
+
+	state := in.GetState()
+	if state != nil {
+		if state := in.GetState().Value; state < 0 || state > 4 {
+			return nil, status.Error(codes.InvalidArgument, "Invalid state - state must be between 0 and 4.")
+		}
+	}
+
+	userGroups, err := ListUserGroups(ctx, s.logger, s.db, userID, limit, state, in.GetCursor())
 	if err != nil {
+		if err == runtime.ErrUserGroupInvalidCursor {
+			return nil, status.Error(codes.InvalidArgument, "Cursor is invalid.")
+		}
 		return nil, status.Error(codes.Internal, "Error while trying to list groups for a user.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterListUserGroups(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, userGroups, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, userGroups, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return userGroups, nil
@@ -634,7 +825,7 @@ func (s *ApiServer) ListGroups(ctx context.Context, in *api.ListGroupsRequest) (
 	// Before hook.
 	if fn := s.runtime.BeforeListGroups(); fn != nil {
 		beforeFn := func(clientIP, clientPort string) error {
-			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
+			result, err, code := fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, in)
 			if err != nil {
 				return status.Error(code, err.Error())
 			}
@@ -648,7 +839,7 @@ func (s *ApiServer) ListGroups(ctx context.Context, in *api.ListGroupsRequest) (
 		}
 
 		// Execute the before function lambda wrapped in a trace for stats measurement.
-		err := traceApiBefore(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
+		err := traceApiBefore(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), beforeFn)
 		if err != nil {
 			return nil, err
 		}
@@ -662,19 +853,34 @@ func (s *ApiServer) ListGroups(ctx context.Context, in *api.ListGroupsRequest) (
 		limit = int(in.GetLimit().Value)
 	}
 
-	groups, err := ListGroups(ctx, s.logger, s.db, in.GetName(), limit, in.GetCursor())
+	var open *bool
+	openIn := in.GetOpen()
+	if openIn != nil {
+		open = new(bool)
+		*open = openIn.GetValue()
+	}
+
+	edgeCount := -1
+	if in.Members != nil {
+		edgeCount = int(in.Members.GetValue())
+	}
+
+	groups, err := ListGroups(ctx, s.logger, s.db, in.GetName(), in.GetLangTag(), open, edgeCount, limit, in.GetCursor())
 	if err != nil {
+		if sErr, ok := err.(*statusError); ok {
+			return nil, sErr.Status()
+		}
 		return nil, status.Error(codes.Internal, "Error while trying to list groups.")
 	}
 
 	// After hook.
 	if fn := s.runtime.AfterListGroups(); fn != nil {
-		afterFn := func(clientIP, clientPort string) {
-			fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groups, in)
+		afterFn := func(clientIP, clientPort string) error {
+			return fn(ctx, s.logger, ctx.Value(ctxUserIDKey{}).(uuid.UUID).String(), ctx.Value(ctxUsernameKey{}).(string), ctx.Value(ctxVarsKey{}).(map[string]string), ctx.Value(ctxExpiryKey{}).(int64), clientIP, clientPort, groups, in)
 		}
 
 		// Execute the after function lambda wrapped in a trace for stats measurement.
-		traceApiAfter(ctx, s.logger, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
+		traceApiAfter(ctx, s.logger, s.metrics, ctx.Value(ctxFullMethodKey{}).(string), afterFn)
 	}
 
 	return groups, nil

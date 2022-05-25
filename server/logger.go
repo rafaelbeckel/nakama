@@ -15,16 +15,15 @@
 package server
 
 import (
-	"fmt"
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
-	"time"
-
 	"strings"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"gopkg.in/natefinch/lumberjack.v2"
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
 type LoggingFormat int8
@@ -73,15 +72,14 @@ func SetupLogging(tmpLogger *zap.Logger, config Config) (*zap.Logger, *zap.Logge
 		multiLogger := NewMultiLogger(consoleLogger, fileLogger)
 
 		if config.GetLogger().Stdout {
-			zap.RedirectStdLog(multiLogger)
+			RedirectStdLog(multiLogger)
 			return multiLogger, multiLogger
-		} else {
-			zap.RedirectStdLog(fileLogger)
-			return fileLogger, multiLogger
 		}
+		RedirectStdLog(fileLogger)
+		return fileLogger, multiLogger
 	}
 
-	zap.RedirectStdLog(consoleLogger)
+	RedirectStdLog(consoleLogger)
 	return consoleLogger, consoleLogger
 }
 
@@ -126,7 +124,7 @@ func NewRotatingJSONFileLogger(consoleLogger *zap.Logger, config Config, level z
 		Compress:   config.GetLogger().Compress,
 	})
 	core := zapcore.NewCore(jsonEncoder, writeSyncer, level)
-	options := []zap.Option{zap.AddStacktrace(zap.ErrorLevel)}
+	options := []zap.Option{zap.AddCaller()}
 	return zap.New(core, options...)
 }
 
@@ -137,7 +135,7 @@ func NewMultiLogger(loggers ...*zap.Logger) *zap.Logger {
 	}
 
 	teeCore := zapcore.NewTee(cores...)
-	options := []zap.Option{zap.AddStacktrace(zap.ErrorLevel)}
+	options := []zap.Option{zap.AddCaller()}
 	return zap.New(teeCore, options...)
 }
 
@@ -145,7 +143,7 @@ func NewJSONLogger(output *os.File, level zapcore.Level, format LoggingFormat) *
 	jsonEncoder := newJSONEncoder(format)
 
 	core := zapcore.NewCore(jsonEncoder, zapcore.Lock(output), level)
-	options := []zap.Option{zap.AddStacktrace(zap.ErrorLevel)}
+	options := []zap.Option{zap.AddCaller()}
 	return zap.New(core, options...)
 }
 
@@ -157,10 +155,10 @@ func newJSONEncoder(format LoggingFormat) zapcore.Encoder {
 			LevelKey:       "severity",
 			NameKey:        "logger",
 			CallerKey:      "caller",
-			MessageKey:     "msg",
+			MessageKey:     "message",
 			StacktraceKey:  "stacktrace",
 			EncodeLevel:    StackdriverLevelEncoder,
-			EncodeTime:     StackdriverTimeEncoder,
+			EncodeTime:     zapcore.RFC3339NanoTimeEncoder,
 			EncodeDuration: zapcore.StringDurationEncoder,
 			EncodeCaller:   zapcore.ShortCallerEncoder,
 		})
@@ -180,27 +178,44 @@ func newJSONEncoder(format LoggingFormat) zapcore.Encoder {
 	})
 }
 
-func StackdriverTimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-	enc.AppendString(fmt.Sprintf("%d%s", t.Unix(), t.Format(".000000000")))
-}
-
 func StackdriverLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
 	switch l {
 	case zapcore.DebugLevel:
-		enc.AppendString("debug")
+		enc.AppendString("DEBUG")
 	case zapcore.InfoLevel:
-		enc.AppendString("info")
+		enc.AppendString("INFO")
 	case zapcore.WarnLevel:
-		enc.AppendString("warning")
+		enc.AppendString("WARNING")
 	case zapcore.ErrorLevel:
-		enc.AppendString("error")
+		enc.AppendString("ERROR")
 	case zapcore.DPanicLevel:
-		enc.AppendString("critical")
+		enc.AppendString("CRITICAL")
 	case zapcore.PanicLevel:
-		enc.AppendString("critical")
+		enc.AppendString("CRITICAL")
 	case zapcore.FatalLevel:
-		enc.AppendString("critical")
+		enc.AppendString("CRITICAL")
 	default:
-		enc.AppendString(fmt.Sprintf("Level(%d)", l))
+		enc.AppendString("DEFAULT")
 	}
+}
+
+type RedirectStdLogWriter struct {
+	logger *zap.Logger
+}
+
+func (r *RedirectStdLogWriter) Write(p []byte) (int, error) {
+	s := string(bytes.TrimSpace(p))
+	if strings.HasPrefix(s, "http: panic serving") {
+		r.logger.Error(s)
+	} else {
+		r.logger.Info(s)
+	}
+	return len(s), nil
+}
+
+func RedirectStdLog(logger *zap.Logger) {
+	log.SetFlags(0)
+	log.SetPrefix("")
+	skipLogger := logger.WithOptions(zap.AddCallerSkip(3))
+	log.SetOutput(&RedirectStdLogWriter{skipLogger})
 }

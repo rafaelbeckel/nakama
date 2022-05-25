@@ -1,14 +1,14 @@
 # Gorilla WebSocket
 
+[![GoDoc](https://godoc.org/github.com/gorilla/websocket?status.svg)](https://godoc.org/github.com/gorilla/websocket)
+[![CircleCI](https://circleci.com/gh/gorilla/websocket.svg?style=svg)](https://circleci.com/gh/gorilla/websocket)
+
 Gorilla WebSocket is a [Go](http://golang.org/) implementation of the
 [WebSocket](http://www.rfc-editor.org/rfc/rfc6455.txt) protocol.
 
-[![Build Status](https://travis-ci.org/gorilla/websocket.svg?branch=master)](https://travis-ci.org/gorilla/websocket)
-[![GoDoc](https://godoc.org/github.com/gorilla/websocket?status.svg)](https://godoc.org/github.com/gorilla/websocket)
-
 ### Documentation
 
-* [API Reference](http://godoc.org/github.com/gorilla/websocket)
+* [API Reference](https://pkg.go.dev/github.com/gorilla/websocket?tab=doc)
 * [Chat example](https://github.com/gorilla/websocket/tree/master/examples/chat)
 * [Command example](https://github.com/gorilla/websocket/tree/master/examples/command)
 * [Client and server example](https://github.com/gorilla/websocket/tree/master/examples/echo)

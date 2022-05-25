@@ -15,24 +15,34 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/heroiclabs/nakama-common/runtime"
+	"strconv"
 	"time"
 
-	"github.com/golang/protobuf/ptypes/wrappers"
-
-	"context"
-
 	"github.com/gofrs/uuid"
-	"github.com/golang/protobuf/ptypes/timestamp"
-	"github.com/heroiclabs/nakama/api"
-	"github.com/jackc/pgx/pgtype"
+	"github.com/heroiclabs/nakama-common/api"
+	"github.com/jackc/pgtype"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-func GetFriendIDs(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID) (*api.Friends, error) {
+type edgeListCursor struct {
+	// ID fields.
+	State    int64
+	Position int64
+}
+
+// Only used to get all friend IDs for the console. NOTE: Not intended for use in client/runtime APIs.
+func GetFriendIDs(ctx context.Context, logger *zap.Logger, db *sql.DB, userID uuid.UUID) (*api.FriendList, error) {
 	query := `
 SELECT id, state
 FROM users, user_edge WHERE id = destination_id AND source_id = $1`
@@ -44,7 +54,7 @@ FROM users, user_edge WHERE id = destination_id AND source_id = $1`
 	}
 	defer rows.Close()
 
-	friends := make([]*api.Friend, 0)
+	friends := make([]*api.Friend, 0, 10)
 
 	for rows.Next() {
 		var id string
@@ -62,7 +72,7 @@ FROM users, user_edge WHERE id = destination_id AND source_id = $1`
 
 		friends = append(friends, &api.Friend{
 			User: user,
-			State: &wrappers.Int32Value{
+			State: &wrapperspb.Int32Value{
 				Value: int32(state.Int64),
 			},
 		})
@@ -72,24 +82,63 @@ FROM users, user_edge WHERE id = destination_id AND source_id = $1`
 		return nil, err
 	}
 
-	return &api.Friends{Friends: friends}, nil
+	return &api.FriendList{Friends: friends}, nil
 }
 
-func GetFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, tracker Tracker, userID uuid.UUID) (*api.Friends, error) {
+func ListFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, statusRegistry *StatusRegistry, userID uuid.UUID, limit int, state *wrapperspb.Int32Value, cursor string) (*api.FriendList, error) {
+	var incomingCursor *edgeListCursor
+	if cursor != "" {
+		cb, err := base64.StdEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, runtime.ErrFriendInvalidCursor
+		}
+		incomingCursor = &edgeListCursor{}
+		if err := gob.NewDecoder(bytes.NewReader(cb)).Decode(incomingCursor); err != nil {
+			return nil, runtime.ErrFriendInvalidCursor
+		}
+
+		// Cursor and filter mismatch. Perhaps the caller has sent an old cursor with a changed filter.
+		if state != nil && int64(state.Value) != incomingCursor.State {
+			return nil, runtime.ErrFriendInvalidCursor
+		}
+	}
+
+	params := make([]interface{}, 0, 4)
 	query := `
 SELECT id, username, display_name, avatar_url,
 	lang_tag, location, timezone, metadata,
-	create_time, users.update_time, state
+	create_time, users.update_time, user_edge.update_time, state, position,
+	facebook_id, google_id, gamecenter_id, steam_id, facebook_instant_game_id, apple_id
 FROM users, user_edge WHERE id = destination_id AND source_id = $1`
+	params = append(params, userID)
+	if state != nil {
+		// Assumes the state has already been validated before this function.
+		query += " AND state = $2"
+		params = append(params, state.Value)
+	}
+	if incomingCursor != nil {
+		query += " AND (source_id, state, position) >= ($1, $2, $3)"
+		if state == nil {
+			params = append(params, incomingCursor.State)
+		}
+		params = append(params, incomingCursor.Position)
+	}
+	query += " ORDER BY state ASC, position ASC"
+	if limit != 0 {
+		// Console API can select all friends in one request. Client/runtime calls will set a non-0 limit.
+		params = append(params, limit+1)
+		query += " LIMIT $" + strconv.Itoa(len(params))
+	}
 
-	rows, err := db.QueryContext(ctx, query, userID)
+	rows, err := db.QueryContext(ctx, query, params...)
 	if err != nil {
 		logger.Error("Error retrieving friends.", zap.Error(err))
 		return nil, err
 	}
 	defer rows.Close()
 
-	friends := make([]*api.Friend, 0)
+	friends := make([]*api.Friend, 0, limit)
+	var outgoingCursor string
 
 	for rows.Next() {
 		var id string
@@ -102,21 +151,35 @@ FROM users, user_edge WHERE id = destination_id AND source_id = $1`
 		var metadata []byte
 		var createTime pgtype.Timestamptz
 		var updateTime pgtype.Timestamptz
+		var edgeUpdateTime pgtype.Timestamptz
 		var state sql.NullInt64
+		var position sql.NullInt64
+		var facebookID sql.NullString
+		var googleID sql.NullString
+		var gamecenterID sql.NullString
+		var steamID sql.NullString
+		var facebookInstantGameID sql.NullString
+		var appleID sql.NullString
 
-		if err = rows.Scan(&id, &username, &displayName, &avatarURL, &lang, &location, &timezone, &metadata, &createTime, &updateTime, &state); err != nil {
+		if err = rows.Scan(&id, &username, &displayName, &avatarURL, &lang, &location, &timezone, &metadata,
+			&createTime, &updateTime, &edgeUpdateTime, &state, &position,
+			&facebookID, &googleID, &gamecenterID, &steamID, &facebookInstantGameID, &appleID); err != nil {
 			logger.Error("Error retrieving friends.", zap.Error(err))
 			return nil, err
 		}
 
-		friendID := uuid.FromStringOrNil(id)
-		online := false
-		if tracker != nil {
-			online = tracker.StreamExists(PresenceStream{Mode: StreamModeNotifications, Subject: friendID})
+		if limit != 0 && len(friends) >= limit {
+			cursorBuf := new(bytes.Buffer)
+			if err := gob.NewEncoder(cursorBuf).Encode(&edgeListCursor{State: state.Int64, Position: position.Int64}); err != nil {
+				logger.Error("Error creating friend list cursor", zap.Error(err))
+				return nil, err
+			}
+			outgoingCursor = base64.StdEncoding.EncodeToString(cursorBuf.Bytes())
+			break
 		}
 
 		user := &api.User{
-			Id:          friendID.String(),
+			Id:          id,
 			Username:    username.String,
 			DisplayName: displayName.String,
 			AvatarUrl:   avatarURL.String,
@@ -124,16 +187,23 @@ FROM users, user_edge WHERE id = destination_id AND source_id = $1`
 			Location:    location.String,
 			Timezone:    timezone.String,
 			Metadata:    string(metadata),
-			CreateTime:  &timestamp.Timestamp{Seconds: createTime.Time.Unix()},
-			UpdateTime:  &timestamp.Timestamp{Seconds: updateTime.Time.Unix()},
-			Online:      online,
+			CreateTime:  &timestamppb.Timestamp{Seconds: createTime.Time.Unix()},
+			UpdateTime:  &timestamppb.Timestamp{Seconds: updateTime.Time.Unix()},
+			// Online filled below.
+			FacebookId:            facebookID.String,
+			GoogleId:              googleID.String,
+			GamecenterId:          gamecenterID.String,
+			SteamId:               steamID.String,
+			FacebookInstantGameId: facebookInstantGameID.String,
+			AppleId:               appleID.String,
 		}
 
 		friends = append(friends, &api.Friend{
 			User: user,
-			State: &wrappers.Int32Value{
+			State: &wrapperspb.Int32Value{
 				Value: int32(state.Int64),
 			},
+			UpdateTime: &timestamppb.Timestamp{Seconds: edgeUpdateTime.Time.Unix()},
 		})
 	}
 	if err = rows.Err(); err != nil {
@@ -141,7 +211,11 @@ FROM users, user_edge WHERE id = destination_id AND source_id = $1`
 		return nil, err
 	}
 
-	return &api.Friends{Friends: friends}, nil
+	if statusRegistry != nil {
+		statusRegistry.FillOnlineFriends(friends)
+	}
+
+	return &api.FriendList{Friends: friends, Cursor: outgoingCursor}, nil
 }
 
 func AddFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, messageRouter MessageRouter, userID uuid.UUID, username string, friendIDs []string) error {
@@ -193,7 +267,7 @@ func AddFriends(ctx context.Context, logger *zap.Logger, db *sql.DB, messageRout
 			SenderId:   userID.String(),
 			Code:       code,
 			Persistent: true,
-			CreateTime: &timestamp.Timestamp{Seconds: time.Now().UTC().Unix()},
+			CreateTime: &timestamppb.Timestamp{Seconds: time.Now().UTC().Unix()},
 		}}
 	}
 

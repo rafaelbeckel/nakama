@@ -16,18 +16,23 @@ package server
 
 import (
 	"fmt"
+	"time"
 
-	"github.com/yuin/gopher-lua"
+	lua "github.com/heroiclabs/nakama/v3/internal/gopher-lua"
 )
 
 const (
 	__RUNTIME_LUA_CTX_ENV              = "env"
 	__RUNTIME_LUA_CTX_MODE             = "execution_mode"
+	__RUNTIME_LUA_CTX_NODE             = "node"
+	__RUNTIME_LUA_CTX_HEADERS          = "headers"
 	__RUNTIME_LUA_CTX_QUERY_PARAMS     = "query_params"
 	__RUNTIME_LUA_CTX_USER_ID          = "user_id"
 	__RUNTIME_LUA_CTX_USERNAME         = "username"
+	__RUNTIME_LUA_CTX_VARS             = "vars"
 	__RUNTIME_LUA_CTX_USER_SESSION_EXP = "user_session_exp"
 	__RUNTIME_LUA_CTX_SESSION_ID       = "session_id"
+	__RUNTIME_LUA_CTX_LANG             = "lang"
 	__RUNTIME_LUA_CTX_CLIENT_IP        = "client_ip"
 	__RUNTIME_LUA_CTX_CLIENT_PORT      = "client_port"
 	__RUNTIME_LUA_CTX_MATCH_ID         = "match_id"
@@ -36,7 +41,7 @@ const (
 	__RUNTIME_LUA_CTX_MATCH_TICK_RATE  = "match_tick_rate"
 )
 
-func NewRuntimeLuaContext(l *lua.LState, env *lua.LTable, mode RuntimeExecutionMode, queryParams map[string][]string, sessionExpiry int64, userID, username, sessionID, clientIP, clientPort string) *lua.LTable {
+func NewRuntimeLuaContext(l *lua.LState, node string, env *lua.LTable, mode RuntimeExecutionMode, headers, queryParams map[string][]string, sessionExpiry int64, userID, username string, vars map[string]string, sessionID, clientIP, clientPort, lang string) *lua.LTable {
 	size := 3
 	if userID != "" {
 		size += 3
@@ -55,6 +60,12 @@ func NewRuntimeLuaContext(l *lua.LState, env *lua.LTable, mode RuntimeExecutionM
 	lt := l.CreateTable(0, size)
 	lt.RawSetString(__RUNTIME_LUA_CTX_ENV, env)
 	lt.RawSetString(__RUNTIME_LUA_CTX_MODE, lua.LString(mode.String()))
+	lt.RawSetString(__RUNTIME_LUA_CTX_NODE, lua.LString(node))
+	if headers == nil {
+		lt.RawSetString(__RUNTIME_LUA_CTX_HEADERS, l.CreateTable(0, 0))
+	} else {
+		lt.RawSetString(__RUNTIME_LUA_CTX_HEADERS, RuntimeLuaConvertValue(l, headers))
+	}
 	if queryParams == nil {
 		lt.RawSetString(__RUNTIME_LUA_CTX_QUERY_PARAMS, l.CreateTable(0, 0))
 	} else {
@@ -64,9 +75,18 @@ func NewRuntimeLuaContext(l *lua.LState, env *lua.LTable, mode RuntimeExecutionM
 	if userID != "" {
 		lt.RawSetString(__RUNTIME_LUA_CTX_USER_ID, lua.LString(userID))
 		lt.RawSetString(__RUNTIME_LUA_CTX_USERNAME, lua.LString(username))
+		if vars != nil {
+			vt := l.CreateTable(0, len(vars))
+			for k, v := range vars {
+				vt.RawSetString(k, lua.LString(v))
+			}
+			lt.RawSetString(__RUNTIME_LUA_CTX_VARS, vt)
+		}
 		lt.RawSetString(__RUNTIME_LUA_CTX_USER_SESSION_EXP, lua.LNumber(sessionExpiry))
 		if sessionID != "" {
 			lt.RawSetString(__RUNTIME_LUA_CTX_SESSION_ID, lua.LString(sessionID))
+			// Lang is never reported without session ID.
+			lt.RawSetString(__RUNTIME_LUA_CTX_LANG, lua.LString(lang))
 		}
 	}
 
@@ -100,6 +120,16 @@ func RuntimeLuaConvertMap(l *lua.LState, data map[string]interface{}) *lua.LTabl
 	return lt
 }
 
+func RuntimeLuaConvertMapInt64(l *lua.LState, data map[string]int64) *lua.LTable {
+	lt := l.CreateTable(0, len(data))
+
+	for k, v := range data {
+		lt.RawSetString(k, RuntimeLuaConvertValue(l, v))
+	}
+
+	return lt
+}
+
 func RuntimeLuaConvertLuaTable(lv *lua.LTable) map[string]interface{} {
 	returnData, _ := RuntimeLuaConvertLuaValue(lv).(map[string]interface{})
 	return returnData
@@ -113,6 +143,7 @@ func RuntimeLuaConvertValue(l *lua.LState, val interface{}) lua.LValue {
 	// Types looked up from:
 	// https://golang.org/pkg/encoding/json/#Unmarshal
 	// https://developers.google.com/protocol-buffers/docs/proto3#scalar
+	// More types added based on observations.
 	switch v := val.(type) {
 	case bool:
 		return lua.LBool(v)
@@ -142,6 +173,8 @@ func RuntimeLuaConvertValue(l *lua.LState, val interface{}) lua.LValue {
 		return lt
 	case map[string]string:
 		return RuntimeLuaConvertMapString(l, v)
+	case map[string]int64:
+		return RuntimeLuaConvertMapInt64(l, v)
 	case map[string]interface{}:
 		return RuntimeLuaConvertMap(l, v)
 	case []string:
@@ -156,8 +189,13 @@ func RuntimeLuaConvertValue(l *lua.LState, val interface{}) lua.LValue {
 			lt.RawSetInt(k+1, RuntimeLuaConvertValue(l, v))
 		}
 		return lt
+	case time.Time:
+		return lua.LNumber(v.UTC().Unix())
+	case nil:
+		return lua.LNil
 	default:
-		return nil
+		// Never return an actual Go `nil` or it will cause nil pointer dereferences inside gopher-lua.
+		return lua.LNil
 	}
 }
 
@@ -171,7 +209,13 @@ func RuntimeLuaConvertLuaValue(lv lua.LValue) interface{} {
 	case lua.LString:
 		return string(v)
 	case lua.LNumber:
-		return float64(v)
+		vf := float64(v)
+		vi := int64(v)
+		if vf == float64(vi) {
+			// If it's a whole number use an actual integer type.
+			return vi
+		}
+		return vf
 	case *lua.LTable:
 		maxn := v.MaxN()
 		if maxn == 0 {
@@ -182,14 +226,15 @@ func RuntimeLuaConvertLuaValue(lv lua.LValue) interface{} {
 				ret[keyStr] = RuntimeLuaConvertLuaValue(value)
 			})
 			return ret
-		} else {
-			// Array.
-			ret := make([]interface{}, 0, maxn)
-			for i := 1; i <= maxn; i++ {
-				ret = append(ret, RuntimeLuaConvertLuaValue(v.RawGetInt(i)))
-			}
-			return ret
 		}
+		// Array.
+		ret := make([]interface{}, 0, maxn)
+		for i := 1; i <= maxn; i++ {
+			ret = append(ret, RuntimeLuaConvertLuaValue(v.RawGetInt(i)))
+		}
+		return ret
+	case *lua.LFunction:
+		return v.String()
 	default:
 		return v
 	}
